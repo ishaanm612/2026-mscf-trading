@@ -199,6 +199,8 @@ class VolatilityStrategy:
                 return StrategyDecision(state, forecast, models, portfolio, straddle, parity,
                                         (DesiredTrade("RTM", -state.rtm_position, "expiry RTM reduction"),),
                                         "exit: configured expiry window", age)
+            return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
+                                    "wait: configured expiry window blocks new entries", age)
         hedge = calculate_hedge_order(portfolio.delta, self.config.hedge_threshold)
         if abs(portfolio.delta) >= self.config.max_safe_delta:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity,

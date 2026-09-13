@@ -4,9 +4,17 @@ import json
 import os
 import time
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+
+class RITReadError(RuntimeError):
+    """A read-only RIT request could not obtain a reliable response."""
+
+
+class RITTransportError(RuntimeError):
+    """A non-retryable RIT transport failure, including a mutation failure."""
 
 
 class Client:
@@ -57,6 +65,12 @@ class Client:
                 except ValueError:
                     delay = 1
                 time.sleep(max(0.1, min(delay, 10)))
+            except (OSError, TimeoutError, URLError) as error:
+                if method != "GET":
+                    raise RITTransportError(f"RIT {method} {endpoint}: transport failure") from error
+                if attempt == 2:
+                    raise RITReadError(f"RIT GET {endpoint}: transport unavailable after 3 attempts") from error
+                time.sleep(0.25 * (attempt + 1))
 
     def snapshot(self, case: str, trading: bool = False) -> dict[str, Any]:
         """Collect a short coherent snapshot and reject stale case transitions.
@@ -79,6 +93,6 @@ class Client:
         end = self.get("case")
         if (end.get("period") != state.get("period") or end["tick"] < state["tick"]
                 or end["tick"] - state["tick"] > 2 or end["status"] != state["status"]):
-            raise RuntimeError("Case changed or snapshot took more than two ticks; retry with fresh data")
+            raise RITReadError("Case changed or snapshot took more than two ticks; retry with fresh data")
         result["case"] = end
         return result

@@ -55,6 +55,16 @@ class VolatilityV1Tests(unittest.TestCase):
         self.assertEqual(decision.desired_trades[0].symbol, "RTM")
         self.assertEqual(decision.desired_trades[0].quantity, -6100)
 
+    def test_expiry_window_never_opens_a_flat_straddle(self) -> None:
+        """Block fresh signals once the configured inventory-reduction window starts."""
+
+        snapshot = demo("volatility")
+        snapshot["case"]["tick"] = 261
+        snapshot["news"] = [{"news_id": 1, "tick": 261, "body": "New analyst event."}]
+        decision = VolatilityStrategy(VolatilityConfig(close_tick=240), fallback_sigma=.32).decide(snapshot)
+        self.assertEqual(decision.desired_trades, ())
+        self.assertEqual(decision.reason, "wait: configured expiry window blocks new entries")
+
     def test_explainable_log_generates_reaction_chart(self) -> None:
         """Persist factors and render the offline market-maker convergence SVG."""
 

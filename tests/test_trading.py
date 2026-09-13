@@ -1,12 +1,14 @@
 """Behavior tests using a tiny exchange double, never the practice accounts."""
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from bot import Bot
+from client import Client, RITReadError, RITTransportError
 from execution import Executor
 from models.news import forecast
 from risk import check, RiskError
@@ -62,6 +64,45 @@ class Exchange:
 
 
 class Trading(unittest.TestCase):
+    def test_get_timeout_retries_but_post_timeout_does_not(self):
+        """Retry safe market-data reads while preserving one-shot mutations."""
+
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok": true}'
+        environment = {"RIT_API_MODE": "dma", "RIT_USERNAME": "test", "RIT_PASSWORD": "test"}
+        with patch.dict(os.environ, environment, clear=True), patch("client.time.sleep"), \
+             patch("client.urlopen", side_effect=[TimeoutError("temporary"), response]) as open_request:
+            self.assertEqual(Client("http://example.test/v1").get("case"), {"ok": True})
+            self.assertEqual(open_request.call_count, 2)
+        with patch.dict(os.environ, environment, clear=True), patch("client.urlopen", side_effect=TimeoutError("temporary")) as open_request:
+            with self.assertRaises(RITTransportError):
+                Client("http://example.test/v1").request("POST", "orders")
+            self.assertEqual(open_request.call_count, 1)
+
+    def test_exhausted_get_timeout_is_a_recoverable_read_error(self):
+        """Classify exhausted read retries so watched loops can continue safely."""
+
+        environment = {"RIT_API_MODE": "dma", "RIT_USERNAME": "test", "RIT_PASSWORD": "test"}
+        with patch.dict(os.environ, environment, clear=True), patch("client.time.sleep"), \
+             patch("client.urlopen", side_effect=TimeoutError("temporary")) as open_request:
+            with self.assertRaises(RITReadError):
+                Client("http://example.test/v1").get("case")
+            self.assertEqual(open_request.call_count, 3)
+
+    def test_incoherent_snapshot_is_a_recoverable_read_error(self):
+        """Allow a watch loop to retry a case transition without placing an order."""
+
+        environment = {"RIT_API_MODE": "dma", "RIT_USERNAME": "test", "RIT_PASSWORD": "test"}
+        responses = [
+            {"tick": 10, "period": 1, "status": "ACTIVE"},
+            [],
+            [],
+            {"tick": 13, "period": 1, "status": "ACTIVE"},
+        ]
+        with patch.dict(os.environ, environment, clear=True), patch.object(Client, "get", side_effect=responses):
+            with self.assertRaises(RITReadError):
+                Client("http://example.test/v1").snapshot("volatility")
+
     def test_open_orders_block_new_actions(self):
         snapshot = demo("volatility")
         snapshot["orders"] = [{"order_id": 1}]

@@ -105,8 +105,10 @@ justify a more complete sizing model.
 
 The decision priority is: inactive/expiry handling, expiry-window reduction,
 hard delta safety hedge, ordinary delta hedge, convergence exit, then new
-entry. Entry and exit thresholds are separate. This hysteresis avoids rapidly
-opening and closing on a small noisy edge.
+entry. Once the expiry window begins, the strategy may reduce inventory or
+hedge RTM but can never open a fresh straddle, including while flat. Entry and
+exit thresholds are separate. This hysteresis avoids rapidly opening and
+closing on a small noisy edge.
 
 `hedge_threshold` creates a no-trade band because RTM commissions make tiny
 hedges expensive. `max_safe_delta` is lower than the competition boundary and

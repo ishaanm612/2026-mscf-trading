@@ -69,7 +69,11 @@ export RIT_PASSWORD='your-password'
 python3 run.py volatility --source api --sigma 0.25 --watch --record data/volatility.jsonl
 ```
 
-Environment variables are read directly; `.env` files are not automatically loaded. Keep credentials out of source control. Ctrl+C stops polling. API errors stop the runner; GET rate-limit retries are bounded.
+Copy `.env.example` to `.env` and replace its placeholders; all project entry
+points load that file automatically. Shell variables take precedence, so an
+operator can override one setting for a command without editing `.env`. Keep
+credentials out of source control. Ctrl+C stops polling. API errors stop the
+runner; GET rate-limit retries are bounded.
 
 Replay recorded observations without connecting:
 

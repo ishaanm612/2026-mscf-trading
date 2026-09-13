@@ -4,10 +4,12 @@ import time
 import os
 from typing import Any
 from models import etf, volatility
-from client import Client
+from client import Client, RITReadError
 from bot import Bot
+from environment import load_env_file
 from execution import Executor
 from volatility.logger import StrategyLogger
+from volatility.supervisor import SessionBoundaryDetector
 
 
 def demo(case: str) -> dict[str, Any]:
@@ -55,12 +57,15 @@ def demo_prices(case: str) -> dict[str, Any]:
 
 def main() -> None:
     """Parse CLI options and run one read-only or explicitly opted-in cycle."""
+    load_env_file(".env")
     parser = argparse.ArgumentParser(description="RIT decision support and opt-in practice trading.")
     parser.add_argument("case", choices=["etf", "volatility"])
     parser.add_argument("--source", choices=["demo", "api", "replay"], default="demo")
     parser.add_argument("--file", help="JSONL snapshot file for replay")
     parser.add_argument("--record", help="Append raw API snapshots to this JSONL file")
     parser.add_argument("--watch", action="store_true")
+    parser.add_argument("--exit-on-session-change", action="store_true",
+                        help="Exit a watched worker when its active heat stops or resets")
     parser.add_argument("--sigma", type=float, help="Annualized volatility assumption, e.g. 0.25")
     parser.add_argument("--rate", type=float, default=0)
     parser.add_argument("--quantity", type=int, default=1000)
@@ -92,6 +97,8 @@ def main() -> None:
         parser.error("replay requires --file")
     if args.watch and args.source != "api":
         parser.error("--watch requires --source api")
+    if args.exit_on_session_change and not args.watch:
+        parser.error("--exit-on-session-change requires --watch")
     client = Client() if args.source == "api" else None
     account = os.environ.get("RIT_USERNAME", "rest").replace("/", "_")
     journal = args.journal or f"data/{args.case}-{account}-execution.jsonl"
@@ -107,6 +114,7 @@ def main() -> None:
               flatten_only=args.flatten_only, basket=args.basket,
               explainability=not args.no_explainability) if args.plan or args.trade else None
     decision_logger = StrategyLogger(args.decision_log) if args.decision_log else None
+    session_boundary = SessionBoundaryDetector() if args.exit_on_session_change else None
     replay = open(args.file) if args.source == "replay" else None
     try:
         while True:
@@ -116,7 +124,17 @@ def main() -> None:
                     break
                 snapshot = json.loads(line)
             else:
-                snapshot = client.snapshot(args.case, trading=bool(bot)) if client else demo(args.case)
+                try:
+                    snapshot = client.snapshot(args.case, trading=bool(bot)) if client else demo(args.case)
+                except RITReadError as error:
+                    if not args.watch:
+                        raise
+                    print(json.dumps({"analysis": f"market data unavailable; retrying: {error}"}), flush=True)
+                    time.sleep(1)
+                    continue
+            if session_boundary and session_boundary.observe(snapshot["case"]):
+                print(json.dumps({"case": snapshot["case"], "analysis": "session boundary; worker stopping"}), flush=True)
+                break
             if args.record:
                 with open(args.record, "a") as output:
                     output.write(json.dumps(snapshot) + "\n")

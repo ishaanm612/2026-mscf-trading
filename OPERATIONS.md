@@ -4,7 +4,10 @@
 
 Run commands from the repository root, with Python 3.10+. There are no pip dependencies. Credentials are environment variables, never source files. Do not run the original scripts in `reference/` alongside this bot.
 
-For DMA, export `RIT_API_MODE=dma`, `RIT_USERNAME`, `RIT_PASSWORD`, and the appropriate `RIT_API_URL`. Use a separate terminal per case. The confirmed practice API URLs are:
+For DMA, place `RIT_API_MODE=dma`, `RIT_USERNAME`, `RIT_PASSWORD`, and the
+appropriate `RIT_API_URL` in the ignored repository `.env` file. Copy
+`.env.example` first if needed. Shell variables take precedence over `.env`.
+Use a separate terminal per case. The confirmed practice API URLs are:
 
 | Case | URL |
 | --- | --- |
@@ -41,6 +44,26 @@ python3 run.py etf --source api --trade --watch --gross-limit 300000 --net-limit
 ETF mode starts with tenders and inventory reduction. Add `--basket` to enable three-leg statistical arbitrage. `--quantity` controls ETF unwind/basket child size (default 1,000; maximum 10,000). Tenders larger than 10,000 units are skipped in this MVP. This intentionally leaves some opportunities unused.
 
 Without `--watch`, only one decision is made. With `--watch`, the process polls until Ctrl+C, including through stopped sessions. Ctrl+C stops further submissions; it does not flatten holdings or cancel an order that may already have reached the server. A process lock prevents two instances from using the same journal; run only one bot per account and do not bypass this with alternate journal paths.
+
+### Restart automatically at practice-heat boundaries
+
+Use the lifecycle supervisor when a practice server repeatedly stops and starts.
+It waits for RIT to report `ACTIVE`, launches exactly one worker for that heat,
+and starts another only after the worker observes a stop, a changed period, or a
+reset tick.  Decision logs, recordings, and execution journals stay append-only
+across heats; the dashboard can therefore retain history while separating runs.
+
+```sh
+python3 scripts/supervise_volatility.py --trade \
+  --decision-log data/volatility-decisions.jsonl \
+  --record data/volatility-snapshots.jsonl
+```
+
+The supervisor does not restart a worker that exits with an API, execution, or
+risk error. Inspect `--check`, resolve open orders, and run `--reconcile` before
+starting it again. This prevents a market reset from disguising an ambiguous
+order outcome as a safe restart. Use Ctrl+C to stop both the supervisor and its
+current worker.
 
 ## How one cycle works
 
