@@ -35,6 +35,11 @@ volatility/
   hedging.py         RTM no-trade-band hedge calculation
   strategy.py        Pure decision orchestration and abstract desired orders
   logger.py          Append-only structured decision logs
+  DESIGN.md          Rationale, units, reserves, and calibration plan
+analysis/
+  reaction.py        Offline SVG chart of market-IV convergence after news
+dashboard/
+  server.py          Local live GUI for explainable decision logs
 tests/               Model, execution, and full-round behavior tests
 reference/           Original Rotman scripts, named by case and API
 data/                Local recordings (ignored by Git)
@@ -70,6 +75,28 @@ Replay recorded observations without connecting:
 
 ```sh
 python3 run.py volatility --source replay --file data/volatility.jsonl --sigma 0.25
+```
+
+Record explainable V1 decisions during a plan or an authorized practice heat,
+then render the market-maker reaction chart offline:
+
+```sh
+python3 run.py volatility --source replay --file data/volatility.jsonl --plan \
+  --decision-log data/volatility-decisions.jsonl
+python3 -m analysis.reaction data/volatility-decisions.jsonl \
+  --output data/market-maker-reaction.svg
+```
+
+The chart draws the fair-IV gap by time since news (blue) and by time since a
+straddle signal (purple). It shows association, not proof that our trade caused
+the quote change. `--no-explainability` retains decision measurements while
+omitting the factor-level rationale payload.
+
+For a separate real-time GUI, start the local dashboard and visit the printed
+loopback address. It refreshes as the planner appends decisions:
+
+```sh
+python3 -m dashboard.server --log data/volatility-decisions.jsonl
 ```
 
 ## What is implemented

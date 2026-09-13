@@ -17,7 +17,8 @@ def clip(position: float, size: int) -> int:
 class Bot:
     def __init__(self, client: Any, executor: Any = None, *, case: str, sigma: float | None = None,
                  rate: float = 0.0, quantity: int = 1000, gross_limit: int | None = None,
-                 net_limit: int | None = None, flatten_only: bool = False, basket: bool = False) -> None:
+                 net_limit: int | None = None, flatten_only: bool = False, basket: bool = False,
+                 explainability: bool = True) -> None:
         """Create a case bot and its pure volatility decision controller.
 
         :param client: RIT client used only when execution is enabled.
@@ -30,6 +31,7 @@ class Bot:
         :param net_limit: ETF net exposure limit.
         :param flatten_only: Prevent new exposure and reduce inventory only.
         :param basket: Enable optional serial ETF basket execution.
+        :param explainability: Include factor-level rationale with volatility decisions.
         """
         self.client, self.executor, self.case = client, executor, case
         self.sigma, self.rate, self.quantity = sigma, rate, quantity
@@ -38,7 +40,8 @@ class Bot:
         self.held_basket = None
         self.last_tick = None
         self.last_period = None
-        self.volatility_strategy = VolatilityStrategy(replace(VolatilityConfig(), risk_free_rate=rate), sigma)
+        self.volatility_strategy = VolatilityStrategy(replace(VolatilityConfig(), risk_free_rate=rate,
+                                                              explainability_enabled=explainability), sigma)
         self.pending_volatility_trades: list[DesiredTrade] = []
 
     def submit(self, snapshot: Mapping[str, Any], ticker: str, quantity: int, reason: str,
@@ -88,6 +91,8 @@ class Bot:
         """
 
         decision = self.volatility_strategy.decide(dict(snapshot))
+        decision_fields = decision.as_log_fields()
+        decision_fields["explanation"] = self.volatility_strategy.explain(decision)
         securities = {str(item["ticker"]): item for item in snapshot["securities"]}
         deltas = {"RTM": 1.0, **{item.quote.symbol: 100.0 * item.fair.delta for item in decision.models}}
         if self.flatten_only:
@@ -99,12 +104,14 @@ class Bot:
         if not self.pending_volatility_trades:
             self.pending_volatility_trades.extend(decision.desired_trades)
         if not self.pending_volatility_trades:
-            return {"wait": decision.reason, "decision": decision.as_log_fields()}
+            return {"wait": decision.reason, "decision": decision_fields}
         trade = self.pending_volatility_trades.pop(0)
         if trade.quantity == 0:
-            return {"wait": decision.reason, "decision": decision.as_log_fields()}
+            return {"wait": decision.reason, "decision": decision_fields}
         reason = "volatility mispricing" if trade.reason == "ATM volatility straddle" else trade.reason
-        return self.submit(snapshot, trade.symbol, trade.quantity, reason, deltas)
+        action = self.submit(snapshot, trade.symbol, trade.quantity, reason, deltas)
+        action["decision"] = decision_fields
+        return action
 
     def option_entry(self, snapshot: Mapping[str, Any], analysis: Mapping[str, Any], securities: Mapping[str, Any],
                      rows: Mapping[str, Any], deltas: Mapping[str, float]) -> dict[str, Any] | None:

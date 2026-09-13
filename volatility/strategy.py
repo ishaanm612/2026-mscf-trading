@@ -101,21 +101,43 @@ def _portfolio(state: MarketState, models: tuple[OptionModel, ...], config: Vola
     return portfolio_greeks(state.rtm_position, [(item.quote.position, item.fair) for item in models], config.contract_multiplier)
 
 
-def _size_for_edge(edge: float, config: VolatilityConfig) -> int:
-    """Choose conservative straddle size from net dollar edge buckets.
+def _size_for_edge(straddle: StraddleOpportunity, portfolio: PortfolioGreeks, state: MarketState,
+                   config: VolatilityConfig) -> int:
+    """Size a straddle from edge strength and remaining risk capacity.
 
-    :param edge: Net expected edge per straddle contract.
-    :param config: Entry threshold and maximum V1 size.
-    :returns: Contract count for each leg, or zero when ineligible.
+    The available size is the smallest of the configured concentration cap,
+    remaining server gross/net option capacity, gamma headroom, and vega
+    headroom.  Net edge then scales that safe capacity continuously until
+    ``edge_for_full_risk`` is reached.  This avoids the old fixed 30-contract
+    bucket while still refusing to use all server capacity on a weak signal.
+
+    :param straddle: Cost-adjusted paired option opportunity.
+    :param portfolio: Greeks from confirmed current inventory.
+    :param state: Fresh raw limits and positions.
+    :param config: Risk, capacity, and edge settings.
+    :returns: Contracts for each straddle leg, or zero when no capacity remains.
     """
 
-    if edge < config.entry_edge_per_contract:
+    if straddle.expected_edge_per_contract < config.entry_edge_per_contract:
         return 0
-    if edge < 2.0 * config.entry_edge_per_contract:
-        return min(5, config.max_straddle_contracts)
-    if edge < 4.0 * config.entry_edge_per_contract:
-        return min(15, config.max_straddle_contracts)
-    return min(30, config.max_straddle_contracts)
+    options = [option for option in state.options]
+    gross = sum(abs(option.position) for option in options)
+    net = sum(option.position for option in options)
+    option_limit = next((limit for limit in state.raw.get("limits", []) if limit.get("name") == "options"), {})
+    gross_limit = float(option_limit.get("gross_limit", 0)) * config.max_option_position_fraction
+    net_limit = float(option_limit.get("net_limit", 0)) * config.max_option_position_fraction
+    gross_capacity = max(0, int((gross_limit - gross) // 2))
+    if straddle.side == "BUY":
+        net_capacity = max(0, int((net_limit - net) // 2))
+    else:
+        net_capacity = max(0, int((net_limit + net) // 2))
+    gamma_per_straddle = abs(straddle.call.gamma + straddle.put.gamma) * config.contract_multiplier
+    vega_per_straddle = abs(straddle.call.vega + straddle.put.vega) * config.contract_multiplier
+    gamma_capacity = max(0, int((config.max_portfolio_gamma - abs(portfolio.gamma)) / max(gamma_per_straddle, 1e-9)))
+    vega_capacity = max(0, int((config.max_portfolio_vega - abs(portfolio.vega)) / max(vega_per_straddle, 1e-9)))
+    capacity = min(config.max_straddle_contracts, gross_capacity, net_capacity, gamma_capacity, vega_capacity)
+    edge_fraction = min(1.0, straddle.expected_edge_per_contract / config.edge_for_full_risk)
+    return max(0, int(capacity * edge_fraction))
 
 
 class VolatilityStrategy:
@@ -188,11 +210,14 @@ class VolatilityStrategy:
             exits = tuple(DesiredTrade(item.quote.symbol, -item.quote.position, "straddle convergence exit")
                           for item in open_atm if item.quote.position)
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, exits, "exit: remaining edge below hysteresis threshold", age)
+        if any(item.quote.position for item in models):
+            return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
+                                    "wait: existing option inventory is being held and risk-managed", age)
         if not new_news:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: no new analyst/news event", age)
         if straddle is None:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: ATM straddle lacks executable edge", age)
-        quantity = _size_for_edge(straddle.expected_edge_per_contract, self.config)
+        quantity = _size_for_edge(straddle, portfolio, state, self.config)
         signed = quantity if straddle.side == "BUY" else -quantity
         if quantity == 0:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: straddle edge below entry threshold", age)
@@ -200,3 +225,54 @@ class VolatilityStrategy:
                                 (DesiredTrade(straddle.call.symbol, signed, "ATM volatility straddle"),
                                  DesiredTrade(straddle.put.symbol, signed, "ATM volatility straddle")),
                                 "enter: new news and cost-adjusted ATM straddle edge", age)
+
+    def explain(self, decision: StrategyDecision) -> dict[str, Any]:
+        """Describe the observable inputs and gates behind a decision.
+
+        The returned structure is deliberately numeric and stable enough for
+        JSONL replay.  It records factors rather than claiming causal certainty
+        about an eventual fill or P&L outcome.
+
+        :param decision: Decision previously produced by :meth:`decide`.
+        :returns: Factor-level rationale, or an empty mapping when disabled.
+        """
+
+        if not self.config.explainability_enabled:
+            return {}
+        straddle = decision.straddle
+        entry = None if straddle is None else {
+            "strike": straddle.strike,
+            "side": straddle.side,
+            "combined_edge_per_straddle": straddle.expected_edge_per_contract,
+            "call_edge_per_contract": straddle.call.expected_edge_per_contract,
+            "put_edge_per_contract": straddle.put.expected_edge_per_contract,
+            "entry_threshold": self.config.entry_edge_per_contract,
+            "exit_threshold": self.config.exit_edge_per_contract,
+            "call_market_iv": straddle.call.market_iv,
+            "put_market_iv": straddle.put.market_iv,
+        }
+        return {
+            "decision_reason": decision.reason,
+            "forecast_factors": {
+                "fair_remaining_sigma": decision.forecast.sigma,
+                "integrated_variance": decision.forecast.integrated_variance,
+                "recognized_news_ids": decision.forecast.recognized_news_ids,
+                "unparsed_news_ids": decision.forecast.unparsed_news_ids,
+                "time_since_latest_news_ticks": decision.time_since_latest_news,
+            },
+            "risk_factors": {
+                "portfolio_delta": decision.portfolio.delta,
+                "portfolio_gamma": decision.portfolio.gamma,
+                "portfolio_vega": decision.portfolio.vega,
+                "hedge_threshold": self.config.hedge_threshold,
+                "max_safe_delta": self.config.max_safe_delta,
+                "expiry_reduction_tick": self.config.close_tick,
+            },
+            "entry_factors": entry,
+            "selected_trades": [trade.__dict__ for trade in decision.desired_trades],
+            "cost_assumptions": {
+                "option_commission": self.config.option_commission,
+                "rtm_commission_per_share": self.config.rtm_commission_per_share,
+                "safety_margin_per_contract": self.config.safety_margin_per_contract,
+            },
+        }

@@ -7,6 +7,7 @@ from models import etf, volatility
 from client import Client
 from bot import Bot
 from execution import Executor
+from volatility.logger import StrategyLogger
 
 
 def demo(case: str) -> dict[str, Any]:
@@ -72,6 +73,8 @@ def main() -> None:
     parser.add_argument("--journal", help="Execution journal path; default is data/<case>-<username>-execution.jsonl")
     parser.add_argument("--check", action="store_true", help="Check case, security metadata, orders and limits without trading")
     parser.add_argument("--reconcile", action="store_true", help="Record current account state after checking an interrupted execution")
+    parser.add_argument("--decision-log", help="Append structured volatility decisions to this JSONL path")
+    parser.add_argument("--no-explainability", action="store_true", help="Omit factor-level rationale from decision logs")
     args = parser.parse_args()
     if args.case == "volatility" and args.sigma is None and not (args.plan or args.trade or args.check or args.reconcile):
         parser.error("volatility requires --sigma (use current analyst information)")
@@ -101,7 +104,9 @@ def main() -> None:
     executor = Executor(client, journal) if args.trade else None
     bot = Bot(client, executor, case=args.case, sigma=args.sigma, rate=args.rate,
               quantity=args.quantity, gross_limit=args.gross_limit, net_limit=args.net_limit,
-              flatten_only=args.flatten_only, basket=args.basket) if args.plan or args.trade else None
+              flatten_only=args.flatten_only, basket=args.basket,
+              explainability=not args.no_explainability) if args.plan or args.trade else None
+    decision_logger = StrategyLogger(args.decision_log) if args.decision_log else None
     replay = open(args.file) if args.source == "replay" else None
     try:
         while True:
@@ -118,6 +123,8 @@ def main() -> None:
             if snapshot["case"]["status"] == "ACTIVE":
                 result = bot.step(snapshot) if bot else (volatility.analyze(snapshot, args.sigma, args.rate) if args.case == "volatility"
                           else etf.analyze(snapshot, args.quantity, args.gross_limit, args.net_limit))
+                if decision_logger and args.case == "volatility" and isinstance(result, dict) and "decision" in result:
+                    decision_logger.write("volatility_decision", result["decision"])
                 print(json.dumps({"case": snapshot["case"], "analysis": result}, allow_nan=False), flush=True)
             else:
                 print(json.dumps({"case": snapshot["case"], "analysis": "inactive"}), flush=True)

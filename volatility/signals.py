@@ -108,14 +108,30 @@ def model_options(state: MarketState, fair_sigma: float, config: VolatilityConfi
 
 
 def _reserved_cost_per_contract(model: OptionModel, config: VolatilityConfig) -> float:
-    """Estimate commission and one delta-hedge cost for one option contract.
+    """Estimate round-trip costs and a model-risk cushion for one option contract.
+
+    The executable bid or ask already accounts for crossing the entry spread, so
+    it is not charged again here.  The reserve still assumes a future option
+    exit commission and one initial-plus-one-closing RTM hedge.  That gives::
+
+        2 * option_commission
+        + 2 * abs(delta) * contract_multiplier * rtm_commission_per_share
+        + safety_margin_per_contract
+
+    A straddle sums this reserve for each leg.  This deliberately overstates
+    RTM hedge cost because call and put deltas partially offset; V1 accepts the
+    false negatives in exchange for avoiding fragile, small theoretical edges.
+    Calibration can replace this with a portfolio-level hedge estimate.
 
     :param model: Fair option model.
     :param config: Cost and multiplier settings.
     :returns: Conservative dollar reserve per contract.
     """
 
-    return config.option_commission + abs(model.fair.delta) * config.contract_multiplier * config.rtm_commission_per_share
+    hedge_shares = abs(model.fair.delta) * config.contract_multiplier
+    return (2.0 * config.option_commission
+            + 2.0 * hedge_shares * config.rtm_commission_per_share
+            + config.safety_margin_per_contract)
 
 
 def find_mispricings(models: tuple[OptionModel, ...], fair_sigma: float, config: VolatilityConfig) -> tuple[Opportunity, ...]:

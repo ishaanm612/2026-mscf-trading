@@ -20,8 +20,13 @@ class VolatilityConfig:
     :param entry_edge_per_contract: Minimum net edge required to enter.
     :param exit_edge_per_contract: Net edge below which an open straddle exits.
     :param max_option_position_fraction: Fraction of server option capacity V1 uses.
-    :param max_straddle_contracts: Further V1 cap for one strike straddle.
+    :param max_straddle_contracts: Absolute per-strike concentration cap.
+    :param max_portfolio_gamma: Internal cap on absolute portfolio gamma.
+    :param max_portfolio_vega: Internal cap on absolute portfolio vega.
+    :param edge_for_full_risk: Net edge that earns the full available risk budget.
     :param close_tick: Tick at which V1 starts reducing inventory for expiry.
+    :param safety_margin_per_contract: Additional edge required for model and fill error.
+    :param explainability_enabled: Include factor-level rationale in decision logs.
     """
 
     contract_multiplier: int = 100
@@ -35,8 +40,13 @@ class VolatilityConfig:
     entry_edge_per_contract: float = 4.0
     exit_edge_per_contract: float = 1.0
     max_option_position_fraction: float = 0.60
-    max_straddle_contracts: int = 50
+    max_straddle_contracts: int = 300
+    max_portfolio_gamma: float = 1500.0
+    max_portfolio_vega: float = 80000.0
+    edge_for_full_risk: float = 32.0
     close_tick: int = 240
+    safety_margin_per_contract: float = 1.0
+    explainability_enabled: bool = True
 
     def as_log_fields(self) -> dict[str, Any]:
         """Return a JSON-safe representation for a decision log.

@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 
+from analysis.reaction import _observations, read_decisions, trade_observations, write_svg
 from run import demo
 from volatility.config import VolatilityConfig
 from volatility.forecast import estimate_remaining_volatility
 from volatility.hedging import calculate_hedge_order
+from volatility.logger import StrategyLogger
 from volatility.strategy import VolatilityStrategy
 
 
@@ -50,6 +54,23 @@ class VolatilityV1Tests(unittest.TestCase):
         decision = VolatilityStrategy(VolatilityConfig()).decide(snapshot)
         self.assertEqual(decision.desired_trades[0].symbol, "RTM")
         self.assertEqual(decision.desired_trades[0].quantity, -6100)
+
+    def test_explainable_log_generates_reaction_chart(self) -> None:
+        """Persist factors and render the offline market-maker convergence SVG."""
+
+        snapshot = demo("volatility")
+        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 25%."}]
+        strategy = VolatilityStrategy()
+        decision = strategy.decide(snapshot)
+        fields = decision.as_log_fields()
+        fields["explanation"] = strategy.explain(decision)
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "decisions.jsonl"
+            chart = Path(directory) / "reaction.svg"
+            StrategyLogger(log).write("volatility_decision", fields)
+            records = read_decisions(log)
+            write_svg(_observations(records), chart, trade_observations(records))
+            self.assertIn("Market-maker IV convergence", chart.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

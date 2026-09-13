@@ -6,6 +6,32 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+def _read_events(path: Path) -> list[dict[str, Any]]:
+    """Decode compact or pretty-printed consecutive JSON journal records.
+
+    Earlier runners wrote one indented JSON object after another.  Both formats
+    describe the same append-only journal and must remain readable for safe
+    restart checks; an incomplete trailing object is rejected by the caller.
+
+    :param path: Journal path to decode.
+    :returns: Complete journal records in write order.
+    :raises ValueError: If the journal contains malformed or non-object data.
+    """
+
+    decoder = json.JSONDecoder()
+    content, offset, events = path.read_text(), 0, []
+    while offset < len(content):
+        while offset < len(content) and content[offset].isspace():
+            offset += 1
+        if offset >= len(content):
+            break
+        event, offset = decoder.raw_decode(content, offset)
+        if not isinstance(event, dict):
+            raise ValueError("Execution journal contains a non-object record")
+        events.append(event)
+    return events
+
+
 class Executor:
     def __init__(self, client: Any, journal: str | Path) -> None:
         """Open a single-process execution journal.
@@ -22,7 +48,7 @@ class Executor:
         self.fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
             if self.path.exists():
-                events = [json.loads(line) for line in self.path.read_text().splitlines()]
+                events = _read_events(self.path)
                 if events and events[-1]["event"] not in ("filled", "tender_confirmed", "reconciled"):
                     raise RuntimeError("Unresolved execution journal; inspect account and reconcile before restart")
         except BaseException:
