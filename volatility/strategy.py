@@ -123,7 +123,8 @@ def _size_for_edge(straddle: StraddleOpportunity, portfolio: PortfolioGreeks, st
     options = [option for option in state.options]
     gross = sum(abs(option.position) for option in options)
     net = sum(option.position for option in options)
-    option_limit = next((limit for limit in state.raw.get("limits", []) if limit.get("name") == "options"), {})
+    option_limit = next((limit for limit in state.raw.get("limits", [])
+                         if str(limit.get("name", "")).lower() in {"option", "options", "limit-opt"}), {})
     gross_limit = float(option_limit.get("gross_limit", 0)) * config.max_option_position_fraction
     net_limit = float(option_limit.get("net_limit", 0)) * config.max_option_position_fraction
     gross_capacity = max(0, int((gross_limit - gross) // 2))
