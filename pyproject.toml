@@ -1,0 +1,6 @@
+[project]
+name = "mscf-rit-cases"
+version = "0.1.0"
+description = "RITCxCMU case research and decision-support starters"
+requires-python = ">=3.10"
+dependencies = []
