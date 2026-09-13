@@ -18,8 +18,10 @@ README.md            Setup and commands
 CASES.md             Case rules, sources, assumptions, and next steps
 run.py               Entry point, demos, recording, and replay
 client.py            Shared REST/DMA connection
-etf.py               ETF arbitrage and tender analysis
-volatility.py        Option pricing and portfolio hedging analysis
+models/
+  etf.py             ETF arbitrage and tender analysis
+  volatility.py      Option pricing and portfolio hedging analysis
+  __init__.py        Model package
 tests/test_models.py Model regression tests
 reference/           Original Rotman scripts, named by case and API
 data/                Local recordings (ignored by Git)
@@ -59,8 +61,8 @@ python3 run.py volatility --source replay --file data/volatility.jsonl --sigma 0
 
 ## What is implemented
 
-- `etf.py`: remaining-depth VWAP, FX-adjusted basket comparisons with fees, weighted exposure and sequential hypothetical-fill checks, fixed-price tender unwind estimates. Supply `--gross-limit` and `--net-limit` from the actual session; otherwise risk eligibility is unknown (`null`).
-- `volatility.py`: Black-Scholes fair values, delta/vega, numerical implied volatility, bid/ask signals with cost reserves, portfolio exposure, and RTM hedge suggestions. `--sigma` is an explicit annualized forecast assumption; news is displayed but not automatically interpreted. `--rate` defaults to zero.
+- `models/etf.py`: remaining-depth VWAP, FX-adjusted basket comparisons with fees, weighted exposure and sequential hypothetical-fill checks, fixed-price tender unwind estimates. Supply `--gross-limit` and `--net-limit` from the actual session; otherwise risk eligibility is unknown (`null`).
+- `models/volatility.py`: Black-Scholes fair values, delta/vega, numerical implied volatility, bid/ask signals with cost reserves, portfolio exposure, and RTM hedge suggestions. `--sigma` is an explicit annualized forecast assumption; news is displayed but not automatically interpreted. `--rate` defaults to zero.
 - `reference/`: unmodified official starter scripts. These require their own third-party dependencies and some can submit trades; do not use them as the project entry point.
 - `CASES.md`: source links, rules, ambiguities, and next implementation steps.
 

@@ -1,7 +1,6 @@
 import math
 import unittest
-import etf
-import volatility
+from models import etf, volatility
 from run import demo
 
 

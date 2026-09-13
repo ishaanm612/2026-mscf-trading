@@ -1,8 +1,7 @@
 import argparse
 import json
 import time
-import etf
-import volatility
+from models import etf, volatility
 from client import Client
 
 

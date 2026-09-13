@@ -8,10 +8,10 @@ This repository prepares the two RITCxCMU 2026 simulated trading cases: ETF arbi
 2. `CASES.md`: published rules, source links, model assumptions, and missing features.
 3. `run.py`: CLI, synthetic demo snapshots, recording/replay, and polling loop.
 4. `client.py`: shared read-only REST/DMA transport and API snapshot collection.
-5. `etf.py` or `volatility.py`: independent case analysis; each exposes `analyze(snapshot, ...)` and returns a JSON-serializable report.
+5. `models/etf.py` or `models/volatility.py`: independent case analysis; each exposes `analyze(snapshot, ...)` and returns a JSON-serializable report.
 6. `tests/test_models.py`: pricing and risk regression tests.
 
-`reference/{etf,volatility}_{rest,dma}.py` contains original external examples. Read only when checking upstream API behavior; edit the root modules for project changes. `data/` holds local recordings and is not source code.
+`reference/{etf,volatility}_{rest,dma}.py` contains original external examples. Read only when checking upstream API behavior; edit the project modules for project changes. `data/` holds local recordings and is not source code.
 
 ## Validation
 
