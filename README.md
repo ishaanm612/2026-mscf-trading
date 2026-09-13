@@ -1,6 +1,6 @@
 # MSCF trading: RITCxCMU 2026
 
-Python starters for **Algorithmic ETF Arbitrage** and **Volatility Trading**, with shared REST/DMA access, offline demos, JSONL recording/replay, and model tests. Python 3.10+; no external packages required for our runner.
+A conservative practice-trading MVP for **Algorithmic ETF Arbitrage** and **Volatility Trading**, with shared REST/DMA access, offline demos, news parsing, opt-in execution, risk checks, and JSONL recording/replay. Python 3.10+; no external packages required for our runner.
 
 ```sh
 python3 run.py etf
@@ -16,13 +16,26 @@ These commands produce decision-support JSON. No orders, tender acceptances, or 
 AGENTS.md            Agent instructions and reading order
 README.md            Setup and commands
 CASES.md             Case rules, sources, assumptions, and next steps
-run.py               Entry point, demos, recording, and replay
-client.py            Shared REST/DMA connection
+run.py               Thin CLI, demos, recording, and replay
+client.py             Shared REST/DMA connection
+bot.py                ETF compatibility and execution bridge
+risk.py               Pre-trade checks
+execution.py          Serial orders, fill confirmation, recovery journal
+OPERATIONS.md        Trading commands, design notes, recovery
 models/
   etf.py             ETF arbitrage and tender analysis
-  volatility.py      Option pricing and portfolio hedging analysis
+  volatility.py      Black-Scholes prices, Greeks, and implied volatility
+  news.py            Weekly volatility announcement parser
   __init__.py        Model package
-tests/test_models.py Model regression tests
+volatility/
+  config.py          All V1 costs, clocks, thresholds, and capacity settings
+  market_data.py     Typed RIT snapshot ingestion
+  forecast.py        News parsing and remaining integrated-variance forecast
+  signals.py         Executable-edge, ATM straddle, and parity signals
+  hedging.py         RTM no-trade-band hedge calculation
+  strategy.py        Pure decision orchestration and abstract desired orders
+  logger.py          Append-only structured decision logs
+tests/               Model, execution, and full-round behavior tests
 reference/           Original Rotman scripts, named by case and API
 data/                Local recordings (ignored by Git)
 pyproject.toml       Python version and project metadata
@@ -62,8 +75,14 @@ python3 run.py volatility --source replay --file data/volatility.jsonl --sigma 0
 ## What is implemented
 
 - `models/etf.py`: remaining-depth VWAP, FX-adjusted basket comparisons with fees, weighted exposure and sequential hypothetical-fill checks, fixed-price tender unwind estimates. Supply `--gross-limit` and `--net-limit` from the actual session; otherwise risk eligibility is unknown (`null`).
-- `models/volatility.py`: Black-Scholes fair values, delta/vega, numerical implied volatility, bid/ask signals with cost reserves, portfolio exposure, and RTM hedge suggestions. `--sigma` is an explicit annualized forecast assumption; news is displayed but not automatically interpreted. `--rate` defaults to zero.
+- `volatility/`: V1 uses a typed state, news-triggered integrated-variance forecast, all-option Black-Scholes values and Greeks, executable-price edges after commissions/hedging reserves, ATM straddle selection, hysteresis exits, RTM hedge band, put-call-parity scan, and structured decision data. All thresholds are in `VolatilityConfig`.
 - `reference/`: unmodified official starter scripts. These require their own third-party dependencies and some can submit trades; do not use them as the project entry point.
 - `CASES.md`: source links, rules, ambiguities, and next implementation steps.
 
-The next ETF milestone is an execution engine with position/order reconciliation, tender inventory unwinds and FX hedging. Volatility needs a news-driven variance forecast and trade sizing. Current outputs are independent signals, not a jointly risk-approved order plan. Snapshots use sequential API reads; displayed depth and prices can change. Replay recalculates signals only and does not simulate fills or P&L.
+## Trading mode
+
+Read [OPERATIONS.md](OPERATIONS.md) for exact commands and recovery instructions. Default commands remain read-only. `--plan` reports the next bot action; `--trade --source api` enables orders and tender acceptance on the configured simulated account.
+
+Volatility uses weekly news, small option entries, RTM delta hedges, and convergence/time exits. ETF trading prioritizes FX hedging and inventory unwinds, then selective fixed-price tenders. Basket trading is separately enabled with `--basket`. Do not enable `--trade` until a practice heat has been explicitly authorized.
+
+Execution writes intent to disk, submits once, and confirms fills. Partial fills and uncertain outcomes stop the bot. This is a practice MVP, with conservative fixed sizing; it is not a proven profitable strategy. Snapshots are sequential reads, and replay does not simulate fills or P&L.
