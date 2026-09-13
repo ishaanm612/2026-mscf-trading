@@ -1,8 +1,9 @@
 import argparse
 import json
 import time
-from . import etf, volatility
-from .client import Client
+import etf
+import volatility
+from client import Client
 
 
 def demo(case):

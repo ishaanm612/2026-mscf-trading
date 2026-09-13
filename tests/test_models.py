@@ -1,7 +1,8 @@
 import math
 import unittest
-from rit_algo import etf, volatility
-from rit_algo.__main__ import demo
+import etf
+import volatility
+from run import demo
 
 
 class Models(unittest.TestCase):

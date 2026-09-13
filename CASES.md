@@ -18,8 +18,8 @@ Model assumption: one supplied sigma applies to all remaining time. A later fore
 
 ## Official support files
 
-- [ETF REST](https://rotmanfrtl.github.io/RITCx%20ETF%20Arbitrage%20Case%20base%20script-REST%20API.py) → `reference/official_rest.py`
-- [ETF DMA](https://rotmanfrtl.github.io/RITCx%20ETF%20Arbitrage%20Case%20base%20script-DMA%20API.py) → `reference/official_dma.py`
+- [ETF REST](https://rotmanfrtl.github.io/RITCx%20ETF%20Arbitrage%20Case%20base%20script-REST%20API.py) → `reference/etf_rest.py`
+- [ETF DMA](https://rotmanfrtl.github.io/RITCx%20ETF%20Arbitrage%20Case%20base%20script-DMA%20API.py) → `reference/etf_dma.py`
 - [Volatility REST](https://rotmanfrtl.github.io/RITCx%20Volatility%20Trading%20Case%20base%20script-REST%20API.py) → `reference/volatility_rest.py`
 - [Volatility DMA](https://rotmanfrtl.github.io/RITCx%20Volatility%20Trading%20Case%20base%20script-DMA%20API.py) → `reference/volatility_dma.py`
 
