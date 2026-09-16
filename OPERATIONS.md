@@ -49,7 +49,9 @@ Without `--watch`, only one decision is made. With `--watch`, the process polls 
 
 ### Restart automatically at practice-heat boundaries
 
-Use the lifecycle supervisor when a practice server repeatedly stops and starts.
+Use `scripts/supervise_volatility.py` as the lifecycle supervisor when a
+practice server repeatedly stops and starts. Despite its compatibility filename,
+`--case volatility` (the default) and `--case etf` are both supported.
 It waits for RIT to report `ACTIVE`, launches exactly one worker for that heat,
 and starts another only after the worker observes a stop, a changed period, or a
 reset tick.  Decision logs, recordings, and execution journals stay append-only
@@ -63,7 +65,8 @@ python3 scripts/supervise_volatility.py --trade \
 
 The same supervisor can manage ETF lifecycle restarts. ETF limits must come
 from the active session; `--basket` is still explicit because tender handling
-and inventory reduction are the safer default.
+and inventory reduction are the safer default. Omit `--trade` to keep its
+child in read-only plan mode; add it only for an authorized simulated heat.
 
 ```sh
 python3 scripts/supervise_volatility.py --case etf \

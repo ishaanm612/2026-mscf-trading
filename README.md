@@ -104,12 +104,34 @@ loopback address. It refreshes as the planner appends decisions:
 python3 -m dashboard.server --log data/volatility-decisions.jsonl
 ```
 
+## Supervise practice heats
+
+`scripts/supervise_volatility.py` is the lifecycle supervisor for both cases
+(the filename is retained for compatibility). It waits for a practice heat to
+become active, launches one isolated `run.py` worker, and waits for a confirmed
+stop/reset before launching a worker for the next heat. It plans by default;
+only `--trade` permits simulated account mutations.
+
+```sh
+# Volatility: read-only plan worker by default.
+python3 scripts/supervise_volatility.py --decision-log data/volatility-decisions.jsonl
+
+# ETF: session limits are required; baskets remain separately opt-in.
+python3 scripts/supervise_volatility.py --case etf \
+  --gross-limit 300000 --net-limit 200000 --basket
+```
+
+The supervisor selects `RIT_VOLATILITY_*` or `RIT_ETF_*` local credentials for
+its case. It never restarts a worker that exits with an API or execution error;
+inspect account state and reconcile its journal before manually restarting.
+
 ## What is implemented
 
 - `models/etf.py`: remaining-depth VWAP, FX-adjusted basket comparisons with fees, weighted exposure and sequential hypothetical-fill checks, fixed-price tender unwind estimates. Supply `--gross-limit` and `--net-limit` from the actual session; otherwise risk eligibility is unknown (`null`).
 - `volatility/`: V1 uses a typed state, news-triggered integrated-variance forecast, all-option Black-Scholes values and Greeks, executable-price edges after commissions/hedging reserves, ATM straddle selection, hysteresis exits, RTM hedge band, put-call-parity scan, and structured decision data. All thresholds are in `VolatilityConfig`.
 - `reference/`: unmodified official starter scripts. These require their own third-party dependencies and some can submit trades; do not use them as the project entry point.
 - `CASES.md`: source links, rules, ambiguities, and next implementation steps.
+- `scripts/supervise_volatility.py`: lifecycle supervisor for either practice case.
 
 ## Trading mode
 
