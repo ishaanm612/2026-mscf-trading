@@ -155,9 +155,10 @@ class Bot:
                                               if symbol != "RTM" and row.get("position", 0)]
             if not self.pending_volatility_trades and securities["RTM"].get("position", 0):
                 self.pending_volatility_trades = [DesiredTrade("RTM", -int(securities["RTM"]["position"]), "flatten RTM")]
-        priority_hedge = decision.reason.startswith("hedge:") and not self.flatten_only
+        priority_hedge = decision.reason == "hedge: internal delta boundary" and not self.flatten_only
         if priority_hedge:
-            # Interrupt the pair, preserving the remaining leg for fresh validation.
+            # Only the 6,000-delta safety hedge may interrupt a queued pair.
+            # Ordinary band hedges wait until both straddle legs are confirmed.
             trade = decision.desired_trades[0]
         else:
             if self.pending_volatility_trades and self.pending_volatility_trades[0].reason == "ATM volatility straddle":

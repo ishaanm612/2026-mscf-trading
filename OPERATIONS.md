@@ -92,7 +92,7 @@ Snapshots are not atomic. Volatility click trading can change the account while 
 ## Volatility decisions and units
 
 - An option quote is dollars per underlying share. A position is **contracts**, with 100 shares per contract. Portfolio delta is `RTM shares + sum(contracts × 100 × option delta)`.
-- Announcements assign variance to weeks. For a range, the estimate is the mean of squared endpoints. Remaining-time variance weights each week's estimate by its remaining seconds. Unannounced future weeks inherit the most recent known estimate; this is a modeling assumption.
+- Announcements assign variance to weeks. For a range, the estimate is the mean of squared endpoints. Remaining-time variance weights each week's estimate by its remaining seconds. Unannounced future weeks use a 20% prior, or `--sigma` when supplied; they do not inherit the last print.
 - If absolute portfolio delta exceeds 250 shares, hedge RTM first. Proposed trades cannot increase exposure beyond an internal 6,000-share band, below the published 7,000 penalty threshold.
 - Option entry uses the bid/ask, fair value, and conservative fee reserves. Buy when fair value exceeds the ask by enough; sell when the bid exceeds fair value. Require a further 0.03/share edge, trade ten contracts, cap each option at 50 contracts and total options at 200 gross contracts.
 - Exit when the original signal disappears or reverses. From tick 240, open no new positions and work toward flat inventory. RTM is hedged between option exits. Flat-by-end is a target, not a guarantee under errors or slow execution.

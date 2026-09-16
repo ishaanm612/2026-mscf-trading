@@ -31,10 +31,10 @@ therefore becomes `(0.20^2 + 0.30^2) / 2`, rather than `0.25^2`.
 
 News is parsed from its wording (`this week`, `next week`, or an explicit
 week), never from an assumed release tick. If a volatility-related message is
-ambiguous, the strategy returns no forecast and cannot enter. When a later
-regime is not yet announced, the latest known variance is carried forward and
-logged as an assumption. This gives a usable V1 forecast while making the
-assumption visible in replay data.
+ambiguous, the strategy returns no forecast and cannot enter. Unannounced
+future weeks use a 20% annualized prior (`unannounced_sigma`), or `--sigma`
+when the operator supplies one. Last week's print is not carried forward.
+That prior is a strategy assumption, logged as `used_unannounced_prior`.
 
 ## Pricing and units
 
@@ -104,11 +104,16 @@ justify a more complete sizing model.
 ## Exits and risk priority
 
 The decision priority is: inactive/expiry handling, expiry-window reduction,
-hard delta safety hedge, ordinary delta hedge, convergence exit, then new
-entry. Once the expiry window begins, the strategy may reduce inventory or
-hedge RTM but can never open a fresh straddle, including while flat. Entry and
-exit thresholds are separate. This hysteresis avoids rapidly opening and
-closing on a small noisy edge.
+hard delta safety hedge, ordinary delta hedge for complete inventory, then
+exits, then new entry. Incomplete one-leg inventory skips the ordinary
+3,000-share band so the second straddle leg can fill; the 6,000-share safety
+hedge still fires. Once the expiry window begins, the strategy may reduce
+inventory or hedge RTM but can never open a fresh straddle, including while
+flat. Entry and exit thresholds are separate. Remaining edge below
+`exit_edge_per_contract` still exits. Remaining edge below
+`take_profit_remaining_fraction` of the entry edge also exits, freeing capital
+for later news. A complete straddle whose ATM side has flipped inside the
+news window exits even if hysteresis has not yet been reached.
 
 `hedge_threshold` creates a no-trade band because RTM commissions make tiny
 hedges expensive. `max_safe_delta` is lower than the competition boundary and
@@ -142,10 +147,11 @@ liquidation P&L and does not charge past commissions a second time.
 
 Forecasts resolve overlapping regimes in publication order: the latest
 applicable announcement wins for each tick. A revision published midweek
-replaces only its remaining interval. Expired information can carry forward
-into an unannounced interval; that remains an explicit persistence assumption.
-Only news published by the snapshot tick is eligible. Integration is performed
-on the case's integer tick grid, summing annualized variance times ticks.
+replaces only its remaining interval. Unannounced remaining ticks use
+`unannounced_sigma` (default 20%) or an operator `--sigma` fallback; they do
+not inherit the last printed week. Only news published by the snapshot tick is
+eligible. Integration is performed on the case's integer tick grid, summing
+annualized variance times ticks.
 
 Offline reevaluation of the recorded inventory first requests closing both
 69-contract RTM50 legs at tick 37, instead of the historical tick 230. This is
@@ -194,14 +200,16 @@ observed cycle budget and the candidate entry deadline when entry is evaluated.
 
 ## Paired execution regression correction
 
-A risk hedge interrupts the queued pair without deleting its remaining leg.
-After confirmed hedge completion, the remaining entry leg is rechecked against
-fresh executable prices and the current forecast. It must retain positive
-cost-adjusted edge in its original direction. If that fails, or the current
-strategy requests an exit, confirmed option inventory is explicitly queued for
-unwind. Manual account changes, risk rejection, and mandatory liquidation can
-still invalidate queued intentions. Every subsequent order uses fresh account
-state and its own risk checks; pairs remain non-atomic.
+A 6,000-delta safety hedge may interrupt the queued pair without deleting its
+remaining leg. Ordinary band hedges wait until both legs are confirmed, so a
+50–70 contract first fill is not immediately offset in RTM and then unwound.
+After confirmed safety-hedge completion, the remaining entry leg is rechecked
+against fresh executable prices and the current forecast. It must retain
+positive cost-adjusted edge in its original direction. If that fails, or the
+current strategy requests an exit, confirmed option inventory is explicitly
+queued for unwind. Manual account changes, risk rejection, and mandatory
+liquidation can still invalidate queued intentions. Every subsequent order
+uses fresh account state and its own risk checks; pairs remain non-atomic.
 
 The watched trading runner skips its ordinary one-second sleep after an option
 fill or while a paired leg is pending. It still collects a new snapshot and

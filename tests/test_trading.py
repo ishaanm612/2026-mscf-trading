@@ -1,6 +1,7 @@
 """Behavior tests using a tiny exchange double, never the practice accounts."""
 import copy
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -186,11 +187,30 @@ class Trading(unittest.TestCase):
         executor.order.assert_not_called()
 
     def test_hedge_preserves_and_completes_second_leg(self) -> None:
-        """A confirmed hedge must not silently abandon the pending put."""
+        """Complete the queued put before hedging a one-leg call fill."""
 
         from volatility.strategy import DesiredTrade
         exchange = Exchange("volatility")
         exchange.move("RTM50C", 69)
+        with tempfile.TemporaryDirectory() as directory:
+            executor = Executor(exchange, Path(directory) / "journal.jsonl")
+            bot = Bot(exchange, executor, case="volatility", sigma=.4)
+            bot.pending_volatility_trades = [DesiredTrade("RTM50P", 69, "ATM volatility straddle")]
+            try:
+                self.assertEqual(bot.step(exchange.snapshot())["ticker"], "RTM50P")
+                self.assertEqual(next(r["position"] for r in exchange.state["securities"]
+                                      if r["ticker"] == "RTM50P"), 69)
+                self.assertEqual(bot.pending_volatility_trades, [])
+            finally:
+                executor.close()
+
+    def test_safety_hedge_preserves_and_completes_second_leg(self) -> None:
+        """A 6,000-delta safety hedge may interrupt the pair without dropping the put."""
+
+        from volatility.strategy import DesiredTrade
+        exchange = Exchange("volatility")
+        exchange.move("RTM50C", 69)
+        exchange.move("RTM", 4000)
         with tempfile.TemporaryDirectory() as directory:
             executor = Executor(exchange, Path(directory) / "journal.jsonl")
             bot = Bot(exchange, executor, case="volatility", sigma=.4)
@@ -263,8 +283,8 @@ class Trading(unittest.TestCase):
             {"news_id": 2, "tick": 36, "body": "The realized volatility of RTM next week will be between 16% and 21%"},
             {"news_id": 3, "tick": 75, "ticker": "Week 2", "body": "The realized volatility of RTM this week will be 18%"},
         ]
-        self.assertAlmostEqual(forecast(news, 1)["sigma"], .29)
-        self.assertAlmostEqual(forecast(news, 75)["sigma"], .18)
+        self.assertAlmostEqual(forecast(news, 1)["sigma"], math.sqrt((74 * .29 ** 2 + 225 * .20 ** 2) / 299))
+        self.assertAlmostEqual(forecast(news, 75)["sigma"], math.sqrt((75 * .18 ** 2 + 150 * .20 ** 2) / 225))
         self.assertLess(forecast(news, 36)["sigma"], .29)
         self.assertIsNone(forecast([], 1)["sigma"])
 
@@ -317,7 +337,8 @@ class Trading(unittest.TestCase):
             finally:
                 executor.close()
             self.assertIn("volatility mispricing", reasons)
-            self.assertIn("straddle convergence exit", reasons)
+            self.assertTrue(any(reason in {"straddle convergence exit", "straddle take-profit exit",
+                                           "expiry inventory reduction"} for reason in reasons))
             self.assertTrue(all(s["position"] == 0 for s in exchange.state["securities"]))
 
     def test_profitable_tender_is_unwound_in_children(self):

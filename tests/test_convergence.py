@@ -45,7 +45,7 @@ class ConvergenceTests(unittest.TestCase):
 
         model = ConvergenceModel(10, (-1_000.0, 0, 0, 0, 0, 0), 20, 1.0, .6)
         snapshot = demo("volatility")
-        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 25%."}]
+        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 40%."}]
         decision = VolatilityStrategy(convergence_model=model).decide(snapshot)
         self.assertEqual(decision.reason, "wait: learned convergence return is insufficient")
 

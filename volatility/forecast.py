@@ -36,6 +36,8 @@ class ForecastResult:
     :param regimes: Parsed future and current volatility regimes.
     :param recognized_news_ids: News records parsed successfully.
     :param unparsed_news_ids: Relevant news records rejected conservatively.
+    :param unannounced_prior_sigma: Volatility used for remaining ticks with no regime.
+    :param used_unannounced_prior: True when at least one remaining tick used that prior.
     """
 
     sigma: float | None
@@ -43,6 +45,8 @@ class ForecastResult:
     regimes: tuple[VolatilityRegime, ...]
     recognized_news_ids: tuple[int | str | None, ...]
     unparsed_news_ids: tuple[int | str | None, ...]
+    unannounced_prior_sigma: float | None = None
+    used_unannounced_prior: bool = False
 
 
 def _text(item: Mapping[str, Any]) -> str:
@@ -129,17 +133,19 @@ def parse_regimes(news_history: Iterable[Mapping[str, Any]], current_tick: int, 
     return tuple(regimes), tuple(recognized), tuple(unparsed)
 
 
-def estimate_remaining_volatility(current_time: int, expiry_time: int, news_history: Iterable[Mapping[str, Any]], market_state: object | None = None, fallback_sigma: float | None = None) -> ForecastResult:
+def estimate_remaining_volatility(current_time: int, expiry_time: int, news_history: Iterable[Mapping[str, Any]], market_state: object | None = None, fallback_sigma: float | None = None, unannounced_sigma: float | None = 0.20) -> ForecastResult:
     """Estimate remaining volatility by averaging integrated variance through expiry.
 
-    The latest known regime is carried forward through an unannounced interval.
-    This is explicit in the result rather than a hidden timestamp assumption.
+    Announced intervals use the latest applicable news. Remaining ticks with no
+    regime use ``fallback_sigma`` when the operator supplied one, otherwise
+    ``unannounced_sigma``. Last week's print is not carried into the future.
 
     :param current_time: Current competition tick.
     :param expiry_time: Option-expiry tick.
     :param news_history: Analyst/news records observed so far.
     :param market_state: Reserved for future estimators using state features.
-    :param fallback_sigma: Explicit operator forecast used only when no current regime exists.
+    :param fallback_sigma: Operator override for ticks that have no announcement.
+    :param unannounced_sigma: Default prior for those unannounced remaining ticks.
     :returns: Forecast with integrated variance and parser audit information.
     """
 
@@ -149,18 +155,19 @@ def estimate_remaining_volatility(current_time: int, expiry_time: int, news_hist
         return ForecastResult(None, None, regimes, recognized, unparsed)
     if current_time >= expiry_time:
         return ForecastResult(0.0, 0.0, regimes, recognized, unparsed)
-    # Regimes are in publication order. Resolve overlaps before integration:
-    # the newest applicable announcement wins, including a midweek revision.
-    latest = fallback_sigma * fallback_sigma if fallback_sigma is not None else None
+    gap_sigma = fallback_sigma if fallback_sigma is not None else unannounced_sigma
     total = 0.0
-    for tick in range(expiry_time):
+    used_prior = False
+    for tick in range(current_time, expiry_time):
         applicable = next((regime for regime in reversed(regimes)
                            if regime.start_tick <= tick < regime.end_tick), None)
         if applicable is not None:
-            latest = applicable.variance
-        if tick >= current_time:
-            if latest is None:
-                return ForecastResult(None, None, regimes, recognized, unparsed)
-            total += latest
+            total += applicable.variance
+            continue
+        if gap_sigma is None:
+            return ForecastResult(None, None, regimes, recognized, unparsed, gap_sigma, False)
+        total += gap_sigma * gap_sigma
+        used_prior = True
     duration = expiry_time - current_time
-    return ForecastResult(math.sqrt(total / duration), total, regimes, recognized, unparsed)
+    return ForecastResult(math.sqrt(total / duration), total, regimes, recognized, unparsed,
+                          gap_sigma, used_prior)

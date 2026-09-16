@@ -14,7 +14,7 @@ Our foundation evaluates both basket directions and tender liquidation against v
 
 The PDF overview's “10 different strike prices” conflicts with its five-strike table; its sample news timing also conflicts with the 300-second duration. Discover available tickers and inspect actual session news. Our runner parses ticker strikes rather than assuming security order. Time uses `(300 - tick)/3600`, matching the official starter.
 
-Standalone analysis uses one supplied sigma for remaining time. Bot mode combines weekly forecasts using time-weighted **variance**, uses the mean of endpoint variances for ranges, and carries the latest known variance into unannounced weeks. Unparsed volatility news blocks decisions. Delta hedge suggestions include current stock holdings and require splitting into legal child orders. Cost reserves omit future rehedging and execution uncertainty. The bot checks projected gross/net exposure, intermediate delta, and hedge capacity; execution confirms every fill before the next action.
+Standalone analysis uses one supplied sigma for remaining time. Bot mode combines weekly forecasts using time-weighted **variance**, uses the mean of endpoint variances for ranges, and fills unannounced weeks with a 20% prior (or `--sigma` when supplied) rather than carrying the last print. Unparsed volatility news blocks decisions. Delta hedge suggestions include current stock holdings and require splitting into legal child orders. Cost reserves omit future rehedging and execution uncertainty. The bot checks projected gross/net exposure, intermediate delta, and hedge capacity; execution confirms every fill before the next action.
 
 ## Official support files
 

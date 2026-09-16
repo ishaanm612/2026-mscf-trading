@@ -9,10 +9,22 @@ from pathlib import Path
 from analysis.reaction import _observations, read_decisions, trade_observations, write_svg
 from run import demo
 from volatility.config import VolatilityConfig
-from volatility.forecast import estimate_remaining_volatility
+from volatility.forecast import estimate_remaining_volatility, parse_regimes
 from volatility.hedging import calculate_hedge_order
 from volatility.logger import StrategyLogger
 from volatility.strategy import VolatilityStrategy
+
+
+def _remaining_sigma(tick: int, news: list[dict], expiry: int = 300, prior: float = 0.20) -> float:
+    """Reproduce remaining volatility with the unannounced-week prior."""
+
+    regimes, _, _ = parse_regimes(news, tick, expiry)
+    total = 0.0
+    for current in range(tick, expiry):
+        applicable = next((regime for regime in reversed(regimes)
+                           if regime.start_tick <= current < regime.end_tick), None)
+        total += applicable.variance if applicable is not None else prior * prior
+    return math.sqrt(total / (expiry - tick))
 
 
 class VolatilityV1Tests(unittest.TestCase):
@@ -34,7 +46,7 @@ class VolatilityV1Tests(unittest.TestCase):
         """Generate paired ATM orders only after an analyst/news event."""
 
         snapshot = demo("volatility")
-        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 25%."}]
+        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 40%."}]
         decision = VolatilityStrategy().decide(snapshot)
         self.assertEqual(decision.reason, "enter: new news and cost-adjusted ATM straddle edge")
         self.assertEqual({trade.symbol for trade in decision.desired_trades}, {"RTM50C", "RTM50P"})
@@ -50,7 +62,7 @@ class VolatilityV1Tests(unittest.TestCase):
 
         snapshot = demo("volatility")
         snapshot["securities"][0]["position"] = 6100
-        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 25%."}]
+        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 40%."}]
         decision = VolatilityStrategy(VolatilityConfig()).decide(snapshot)
         self.assertEqual(decision.desired_trades[0].symbol, "RTM")
         self.assertEqual(decision.desired_trades[0].quantity, -6100)
@@ -74,10 +86,12 @@ class VolatilityV1Tests(unittest.TestCase):
             {"news_id": 3, "tick": 75, "body": "Volatility this week is 35%."},
             {"news_id": 4, "tick": 90, "body": "Volatility this week is 30%."},
         ]
-        self.assertAlmostEqual(estimate_remaining_volatility(75, 300, reversed(news)).sigma, .35)
-        self.assertAlmostEqual(estimate_remaining_volatility(89, 300, news).sigma, .35)
-        self.assertAlmostEqual(estimate_remaining_volatility(90, 300, news).sigma, .30)
-        self.assertAlmostEqual(estimate_remaining_volatility(151, 300, news).sigma, .30)
+        self.assertAlmostEqual(estimate_remaining_volatility(75, 300, reversed(news)).sigma, _remaining_sigma(75, news))
+        self.assertAlmostEqual(estimate_remaining_volatility(89, 300, news).sigma, _remaining_sigma(89, news))
+        self.assertAlmostEqual(estimate_remaining_volatility(90, 300, news).sigma, _remaining_sigma(90, news))
+        later = estimate_remaining_volatility(151, 300, news)
+        self.assertAlmostEqual(later.sigma, .20)
+        self.assertTrue(later.used_unannounced_prior)
 
     def test_exits_actual_strike_when_signal_reverses(self) -> None:
         """Close long and short inventory even when another strike becomes ATM."""
@@ -140,7 +154,7 @@ class VolatilityV1Tests(unittest.TestCase):
         """Retain an unused news event for a short window and consume it on entry."""
 
         snapshot = demo("volatility")
-        snapshot["news"] = [{"news_id": 1, "tick": 1, "body": "Current volatility is 25%."}]
+        snapshot["news"] = [{"news_id": 1, "tick": 1, "body": "Current volatility is 40%."}]
         snapshot["case"]["tick"] = 1
         strategy = VolatilityStrategy()
         original = [dict(row) for row in snapshot["securities"]]
@@ -154,11 +168,65 @@ class VolatilityV1Tests(unittest.TestCase):
         snapshot["case"]["tick"] = 20
         self.assertFalse(VolatilityStrategy().decide(snapshot).desired_trades)
 
+    def test_incomplete_straddle_skips_ordinary_hedge(self) -> None:
+        """Finish the missing option leg before hedging temporary one-leg delta."""
+
+        snapshot = demo("volatility")
+        next(row for row in snapshot["securities"] if row["ticker"] == "RTM50C")["position"] = 69
+        decision = VolatilityStrategy(fallback_sigma=.25).decide(snapshot)
+        self.assertEqual(decision.reason, "wait: existing option inventory is being held and risk-managed")
+        self.assertEqual(decision.desired_trades, ())
+
+    def test_safety_hedge_still_fires_on_incomplete_inventory(self) -> None:
+        """Keep the 6,000-share boundary even while a straddle is incomplete."""
+
+        snapshot = demo("volatility")
+        snapshot["securities"][0]["position"] = 5000
+        next(row for row in snapshot["securities"] if row["ticker"] == "RTM50C")["position"] = 69
+        decision = VolatilityStrategy(fallback_sigma=.25).decide(snapshot)
+        self.assertEqual(decision.reason, "hedge: internal delta boundary")
+        self.assertEqual(decision.desired_trades[0].symbol, "RTM")
+
+    def test_take_profit_exits_after_entry_edge_decays(self) -> None:
+        """Free capital once remaining edge is a small fraction of the entry edge."""
+
+        snapshot = demo("volatility")
+        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 40%."}]
+        strategy = VolatilityStrategy()
+        self.assertTrue(strategy.decide(snapshot).desired_trades)
+        for row in snapshot["securities"]:
+            if row["ticker"] in {"RTM50C", "RTM50P"}:
+                row["position"] = 10
+        strategy._entry_edge = 1_000.0
+        snapshot["case"]["tick"] = 2
+        decision = strategy.decide(snapshot)
+        self.assertEqual(decision.reason, "exit: remaining edge below take-profit fraction of entry")
+        self.assertEqual({trade.symbol for trade in decision.desired_trades}, {"RTM50C", "RTM50P"})
+
+    def test_new_news_exits_when_straddle_side_reverses(self) -> None:
+        """Close a complete straddle when a fresh announcement flips the ATM side."""
+
+        snapshot = demo("volatility")
+        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "Current volatility is 40%."}]
+        config = VolatilityConfig(exit_edge_per_contract=-1_000.0, take_profit_remaining_fraction=0.0)
+        strategy = VolatilityStrategy(config)
+        self.assertTrue(strategy.decide(snapshot).desired_trades)
+        for row in snapshot["securities"]:
+            if row["ticker"] in {"RTM50C", "RTM50P"}:
+                row["position"] = 10
+        strategy._entry_edge = None
+        snapshot["case"]["tick"] = 1
+        snapshot["news"].append({"news_id": 2, "tick": 1, "body": "Volatility this week is 5%."})
+        decision = strategy.decide(snapshot)
+        self.assertEqual(decision.reason, "exit: new news reversed the held straddle")
+        self.assertEqual({trade.symbol: trade.quantity for trade in decision.desired_trades},
+                         {"RTM50C": -10, "RTM50P": -10})
+
     def test_explainable_log_generates_reaction_chart(self) -> None:
         """Persist factors and render the offline market-maker convergence SVG."""
 
         snapshot = demo("volatility")
-        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 25%."}]
+        snapshot["news"] = [{"news_id": 1, "tick": 0, "body": "The current annualized realized volatility is 40%."}]
         strategy = VolatilityStrategy()
         decision = strategy.decide(snapshot)
         fields = decision.as_log_fields()

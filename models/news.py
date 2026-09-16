@@ -59,18 +59,28 @@ def forecast(news: Iterable[Mapping[str, Any]], tick: int, fallback: float | Non
         weeks[week] = sum(v * v for v in values) / len(values)
         recognized.append(item.get("news_id"))
     current = min(3, max(0, int(tick) // 75))
-    variance = weeks.get(current, fallback * fallback if fallback is not None else None)
-    if variance is None or unknown:
+    if unknown:
         return {"sigma": None, "recognized": recognized, "unparsed": unknown}
+    if current not in weeks and fallback is None:
+        return {"sigma": None, "recognized": recognized, "unparsed": unknown}
+    prior = fallback * fallback if fallback is not None else 0.20 * 0.20
     weighted = duration = 0
+    used_prior = False
     for week in range(current, 4):
-        variance = weeks.get(week, variance)
+        if week in weeks:
+            variance = weeks[week]
+        elif week == current:
+            variance = fallback * fallback
+        else:
+            variance = prior
+            used_prior = True
         seconds = max(0, (week + 1) * 75 - max(tick, week * 75))
         weighted += variance * seconds
         duration += seconds
     return {
-        "sigma": math.sqrt(weighted / duration) if duration else math.sqrt(variance),
+        "sigma": math.sqrt(weighted / duration) if duration else math.sqrt(prior),
         "recognized": recognized,
         "unparsed": unknown,
-        "assumption": "Latest known variance carried forward into unannounced weeks",
+        "assumption": "Unannounced weeks use a 20% volatility prior rather than the last print",
+        "used_unannounced_prior": used_prior,
     }

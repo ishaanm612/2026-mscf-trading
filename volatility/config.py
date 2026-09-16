@@ -25,6 +25,8 @@ class VolatilityConfig:
     :param max_portfolio_vega: Internal cap on absolute portfolio vega.
     :param edge_for_full_risk: Net edge that earns the full available risk budget.
     :param news_entry_window_ticks: Maximum release age for reevaluating an unused news signal.
+    :param unannounced_sigma: Annualized vol prior for weeks with no announcement yet.
+    :param take_profit_remaining_fraction: Exit when remaining edge falls below this share of entry edge.
     :param convergence_min_expected_pnl: Minimum learned expected P&L per straddle to enter.
     :param close_tick: Optional operator override forcing an earlier liquidation.
     :param cycle_ticks_floor: Conservative startup ticks per complete decision/order cycle.
@@ -50,6 +52,8 @@ class VolatilityConfig:
     max_portfolio_vega: float = 80000.0
     edge_for_full_risk: float = 32.0
     news_entry_window_ticks: int = 10
+    unannounced_sigma: float = 0.20
+    take_profit_remaining_fraction: float = 0.25
     convergence_min_expected_pnl: float = 0.0
     close_tick: int | None = None
     cycle_ticks_floor: int = 3
