@@ -9,6 +9,7 @@ from bot import Bot
 from environment import load_env_file
 from execution import Executor
 from volatility.logger import StrategyLogger
+from volatility.reporting import format_volatility_report, summarize_volatility_result
 from volatility.supervisor import SessionBoundaryDetector
 
 
@@ -80,6 +81,8 @@ def main() -> None:
     parser.add_argument("--reconcile", action="store_true", help="Record current account state after checking an interrupted execution")
     parser.add_argument("--decision-log", help="Append structured volatility decisions to this JSONL path")
     parser.add_argument("--no-explainability", action="store_true", help="Omit factor-level rationale from decision logs")
+    parser.add_argument("--convergence-model", help="Validated JSON convergence model used as an opt-in entry filter")
+    parser.add_argument("--verbose", action="store_true", help="Print raw strategy payloads instead of compact operational reports")
     args = parser.parse_args()
     if args.case == "volatility" and args.sigma is None and not (args.plan or args.trade or args.check or args.reconcile):
         parser.error("volatility requires --sigma (use current analyst information)")
@@ -112,45 +115,81 @@ def main() -> None:
     bot = Bot(client, executor, case=args.case, sigma=args.sigma, rate=args.rate,
               quantity=args.quantity, gross_limit=args.gross_limit, net_limit=args.net_limit,
               flatten_only=args.flatten_only, basket=args.basket,
-              explainability=not args.no_explainability) if args.plan or args.trade else None
+              explainability=not args.no_explainability,
+              convergence_model_path=args.convergence_model) if args.plan or args.trade else None
     decision_logger = StrategyLogger(args.decision_log) if args.decision_log else None
     session_boundary = SessionBoundaryDetector() if args.exit_on_session_change else None
     replay = open(args.file) if args.source == "replay" else None
+    halted_error: str | None = None
     try:
         while True:
-            if replay:
-                line = replay.readline()
-                if not line:
+            try:
+                if replay:
+                    line = replay.readline()
+                    if not line:
+                        break
+                    snapshot = json.loads(line)
+                else:
+                    try:
+                        snapshot = client.snapshot(args.case, trading=bool(bot)) if client else demo(args.case)
+                    except RITReadError as error:
+                        if not args.watch:
+                            raise
+                        print(json.dumps({"analysis": f"market data unavailable; retrying: {error}"}), flush=True)
+                        time.sleep(1)
+                        continue
+                if halted_error is None and session_boundary and session_boundary.observe(snapshot["case"]):
+                    print(json.dumps({"case": snapshot["case"], "analysis": "session boundary; worker stopping"}), flush=True)
                     break
-                snapshot = json.loads(line)
-            else:
-                try:
-                    snapshot = client.snapshot(args.case, trading=bool(bot)) if client else demo(args.case)
-                except RITReadError as error:
-                    if not args.watch:
-                        raise
-                    print(json.dumps({"analysis": f"market data unavailable; retrying: {error}"}), flush=True)
-                    time.sleep(1)
+                if args.record:
+                    with open(args.record, "a") as output:
+                        output.write(json.dumps(snapshot) + "\n")
+                if snapshot["case"]["status"] == "ACTIVE":
+                    result = {"halted": halted_error, "requires_reconciliation": True} if halted_error else bot.step(snapshot) if bot else (volatility.analyze(snapshot, args.sigma, args.rate) if args.case == "volatility"
+                              else etf.analyze(snapshot, args.quantity, args.gross_limit, args.net_limit))
+                    if decision_logger and args.case == "volatility" and isinstance(result, dict) and "decision" in result:
+                        decision_logger.write("volatility_decision", result["decision"])
+                    elif decision_logger and args.case == "volatility" and isinstance(result, dict):
+                        decision_logger.write("execution_wait", {"tick": snapshot["case"]["tick"], **result})
+                    displayed = result
+                    if args.case == "volatility" and bot and not args.verbose and isinstance(result, dict):
+                        print(format_volatility_report(summarize_volatility_result(snapshot, result)), flush=True)
+                    else:
+                        print(json.dumps({"case": snapshot["case"], "analysis": displayed}, allow_nan=False), flush=True)
+                else:
+                    print(json.dumps({"case": snapshot["case"], "analysis": "inactive"}), flush=True)
+                if replay:
                     continue
-            if session_boundary and session_boundary.observe(snapshot["case"]):
-                print(json.dumps({"case": snapshot["case"], "analysis": "session boundary; worker stopping"}), flush=True)
-                break
-            if args.record:
-                with open(args.record, "a") as output:
-                    output.write(json.dumps(snapshot) + "\n")
-            if snapshot["case"]["status"] == "ACTIVE":
-                result = bot.step(snapshot) if bot else (volatility.analyze(snapshot, args.sigma, args.rate) if args.case == "volatility"
-                          else etf.analyze(snapshot, args.quantity, args.gross_limit, args.net_limit))
-                if decision_logger and args.case == "volatility" and isinstance(result, dict) and "decision" in result:
-                    decision_logger.write("volatility_decision", result["decision"])
-                print(json.dumps({"case": snapshot["case"], "analysis": result}, allow_nan=False), flush=True)
-            else:
-                print(json.dumps({"case": snapshot["case"], "analysis": "inactive"}), flush=True)
-            if replay:
-                continue
-            if not args.watch:
-                break
-            time.sleep(1)
+                if not args.watch:
+                    break
+                # Reconcile immediately after a confirmed option fill or while
+                # a paired leg is pending. Each subsequent order still uses a
+                # fresh snapshot and its own preflight and fill confirmation.
+                urgent = (halted_error is None and args.trade and args.case == "volatility" and bot
+                          and (bot.pending_volatility_trades or
+                               (isinstance(result, dict) and str(result.get("ticker", "")).startswith("RTM")
+                                and result.get("ticker") != "RTM"))) if snapshot["case"]["status"] == "ACTIVE" else False
+                if not urgent:
+                    time.sleep(1)
+            except Exception as error:
+                if not args.watch:
+                    raise
+                # Never rerun a failed strategy/execution cycle: an order may
+                # already have reached the exchange. Stay observable, read-only,
+                # and latched across market resets until operator recovery.
+                if halted_error is None:
+                    halted_error = f"{type(error).__name__}: {error}"
+                    if decision_logger:
+                        try:
+                            decision_logger.write("worker_halted", {"error": halted_error,
+                                                  "requires_reconciliation": True})
+                        except OSError:
+                            # Console health output remains available if disk logging fails.
+                            pass
+                print(json.dumps({"analysis": {"halted": halted_error,
+                      "requires_reconciliation": True,
+                      "message": "worker alive; submissions disabled; inspect state before restart"}}), flush=True)
+                time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:

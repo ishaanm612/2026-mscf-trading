@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .env
 data/*.jsonl
+data/convergence-model.json
 data/*.lock

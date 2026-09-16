@@ -211,3 +211,28 @@ def scan_put_call_parity(models: tuple[OptionModel, ...], state: MarketState, co
         if cheap_reversal > 0:
             results.append(ParityOpportunity(strike, cheap_reversal, "buy call, sell put, sell RTM-equivalent"))
     return tuple(sorted(results, key=lambda item: item.edge_per_pair, reverse=True))
+
+
+def held_strike_edge(models: tuple[OptionModel, ...], config: VolatilityConfig) -> float:
+    """Measure signed remaining edge for the actual inventory at one strike.
+
+    Long inventory uses fair minus ask; short inventory uses bid minus fair.
+    This retains the conservative entry-cost reserve for the exit hysteresis
+    comparison. It is a signal score, not liquidation P&L or a new fee charge.
+    Equal quantities form one straddle; uneven legs are weighted relative to
+    the largest leg. Negative values explicitly represent a reversed signal.
+
+    :param models: Nonzero held legs at a single strike.
+    :param config: Contract units and conservative cost assumptions.
+    :returns: Dollars of remaining signal edge per largest-leg contract.
+    """
+
+    scale = max(abs(model.quote.position) for model in models)
+    total = 0.0
+    for model in models:
+        position = model.quote.position
+        gap = (model.fair.price - model.quote.quote.ask if position > 0
+               else model.quote.quote.bid - model.fair.price)
+        total += abs(position) / scale * (
+            gap * config.contract_multiplier - _reserved_cost_per_contract(model, config))
+    return total

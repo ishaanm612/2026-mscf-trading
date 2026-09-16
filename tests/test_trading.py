@@ -103,11 +103,142 @@ class Trading(unittest.TestCase):
             with self.assertRaises(RITReadError):
                 Client("http://example.test/v1").snapshot("volatility")
 
-    def test_open_orders_block_new_actions(self):
+    def test_open_orders_pause_then_resume_with_confirmed_inventory(self) -> None:
+        """Click orders pause the worker and their fills are hedged on resumption."""
+
         snapshot = demo("volatility")
         snapshot["orders"] = [{"order_id": 1}]
-        with self.assertRaises(RuntimeError):
-            Bot(None, case="volatility", sigma=.25).step(snapshot)
+        bot = Bot(None, case="volatility", sigma=.25)
+        self.assertIn("wait", bot.step(snapshot))
+        snapshot["orders"] = []
+        snapshot["securities"][0]["position"] = 4000
+        self.assertEqual(bot.step(snapshot)["quantity"], -4000)
+
+    def test_external_fill_invalidates_queued_straddle_leg(self) -> None:
+        """Do not complete an old pair after a user flattens the account."""
+
+        from volatility.strategy import DesiredTrade
+        snapshot = demo("volatility")
+        bot = Bot(None, case="volatility", sigma=.25)
+        bot.expected_volatility_positions = bot.position_map(snapshot)
+        bot.expected_volatility_positions["RTM50C"] = 10
+        bot.pending_volatility_trades = [DesiredTrade("RTM50P", 10, "ATM volatility straddle")]
+        result = bot.step(snapshot)
+        self.assertIn("wait", result)
+        self.assertEqual(bot.pending_volatility_trades, [])
+
+    def test_click_order_during_preflight_prevents_submission(self) -> None:
+        """A newly opened UI order invalidates a previously planned bot order."""
+
+        snapshot = demo("volatility")
+        snapshot["securities"][0]["position"] = 4000
+        fresh = copy.deepcopy(snapshot)
+        fresh["orders"] = [{"order_id": 99}]
+        client = MagicMock()
+        client.snapshot.return_value = fresh
+        executor = MagicMock()
+        bot = Bot(client, executor, case="volatility", sigma=.25)
+        self.assertIn("wait", bot.step(snapshot))
+        executor.order.assert_not_called()
+
+    def test_risk_rejection_discards_legs_and_next_cycle_hedges(self) -> None:
+        """Reject an unsafe candidate without execution, then manage fresh exposure."""
+
+        from volatility.strategy import DesiredTrade
+        snapshot = demo("volatility")
+        client, executor = MagicMock(), MagicMock()
+        bot = Bot(client, executor, case="volatility", sigma=.25)
+        bot.pending_volatility_trades = [DesiredTrade("RTM50C", 100, "ATM volatility straddle"),
+                                         DesiredTrade("RTM50P", 100, "ATM volatility straddle")]
+        with patch("bot.risk.check", side_effect=RiskError("Projected delta exceeds internal 6000-share band")):
+            result = bot.step(snapshot)
+        self.assertFalse(result["risk_rejection"]["submitted"])
+        self.assertEqual(bot.pending_volatility_trades, [])
+        executor.order.assert_not_called()
+        snapshot["securities"][0]["position"] = 4000
+        client.snapshot.return_value = snapshot
+        client.get.return_value = snapshot["case"]
+        self.assertEqual(bot.step(snapshot)["quantity"], -4000)
+        executor.order.assert_called_once_with("RTM", -4000)
+
+    def test_real_delta_gate_returns_wait(self) -> None:
+        """Exercise the actual 6000-share gate with an oversized deep-ITM leg."""
+
+        from volatility.strategy import DesiredTrade
+        snapshot = demo("volatility")
+        executor = MagicMock()
+        bot = Bot(MagicMock(), executor, case="volatility", sigma=.5)
+        bot.pending_volatility_trades = [DesiredTrade("RTM48C", 100, "ATM volatility straddle")]
+        result = bot.step(snapshot)
+        self.assertIn("6000-share", result["risk_rejection"]["reason"])
+        executor.order.assert_not_called()
+
+    def test_expired_submission_snapshot_returns_wait(self) -> None:
+        """A last-moment market reset is handled before order submission."""
+
+        snapshot = demo("volatility")
+        snapshot["securities"][0]["position"] = 4000
+        client, executor = MagicMock(), MagicMock()
+        client.snapshot.return_value = snapshot
+        client.get.return_value = {"status": "STOPPED", "tick": 0, "period": 1}
+        result = Bot(client, executor, case="volatility", sigma=.25).step(snapshot)
+        self.assertIn("snapshot expired", result["wait"])
+        executor.order.assert_not_called()
+
+    def test_hedge_preserves_and_completes_second_leg(self) -> None:
+        """A confirmed hedge must not silently abandon the pending put."""
+
+        from volatility.strategy import DesiredTrade
+        exchange = Exchange("volatility")
+        exchange.move("RTM50C", 69)
+        with tempfile.TemporaryDirectory() as directory:
+            executor = Executor(exchange, Path(directory) / "journal.jsonl")
+            bot = Bot(exchange, executor, case="volatility", sigma=.4)
+            bot.pending_volatility_trades = [DesiredTrade("RTM50P", 69, "ATM volatility straddle")]
+            try:
+                self.assertEqual(bot.step(exchange.snapshot())["ticker"], "RTM")
+                self.assertEqual(bot.pending_volatility_trades[0].symbol, "RTM50P")
+                self.assertEqual(bot.step(exchange.snapshot())["ticker"], "RTM50P")
+                self.assertEqual(next(r["position"] for r in exchange.state["securities"]
+                                      if r["ticker"] == "RTM50P"), 69)
+            finally:
+                executor.close()
+
+    def test_invalid_pending_leg_unwinds_first_leg(self) -> None:
+        """An obsolete pair request must not leave a lone option held indefinitely."""
+
+        from volatility.strategy import DesiredTrade
+        snapshot = demo("volatility")
+        next(r for r in snapshot["securities"] if r["ticker"] == "RTM50C")["position"] = 10
+        bot = Bot(None, case="volatility", sigma=.1)
+        bot.pending_volatility_trades = [DesiredTrade("RTM50P", 10, "ATM volatility straddle")]
+        result = bot.step(snapshot)
+        self.assertEqual((result["ticker"], result["quantity"]), ("RTM50C", -10))
+
+    def test_second_risk_gate_can_reject_without_crashing(self) -> None:
+        """Fresh server limits may invalidate a candidate before any mutation."""
+
+        snapshot = demo("volatility")
+        snapshot["securities"][0]["position"] = 4000
+        client, executor = MagicMock(), MagicMock()
+        client.snapshot.return_value = snapshot
+        bot = Bot(client, executor, case="volatility", sigma=.25)
+        with patch("bot.risk.check", side_effect=[None, RiskError("Projected server position limit breach")]):
+            self.assertIn("risk_rejection", bot.step(snapshot))
+        executor.order.assert_not_called()
+
+    def test_uncertain_execution_still_propagates(self) -> None:
+        """Never turn an ambiguous submitted order into a retryable no-trade result."""
+
+        snapshot = demo("volatility")
+        snapshot["securities"][0]["position"] = 4000
+        client, executor = MagicMock(), MagicMock()
+        client.snapshot.return_value = snapshot
+        client.get.return_value = snapshot["case"]
+        executor.order.side_effect = TimeoutError("Unknown exchange outcome")
+        with self.assertRaises(TimeoutError):
+            Bot(client, executor, case="volatility", sigma=.25).step(snapshot)
+        executor.order.assert_called_once()
 
     def test_projected_server_limit_uses_inverse_units(self):
         snapshot = demo("etf")

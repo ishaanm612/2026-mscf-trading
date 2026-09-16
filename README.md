@@ -38,6 +38,7 @@ volatility/
   DESIGN.md          Rationale, units, reserves, and calibration plan
 analysis/
   reaction.py        Offline SVG chart of market-IV convergence after news
+  convergence.py     Train an opt-in executable-return convergence filter
 dashboard/
   server.py          Local live GUI for explainable decision logs
 tests/               Model, execution, and full-round behavior tests

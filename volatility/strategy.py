@@ -1,15 +1,18 @@
 """Pure volatility-strategy orchestration that emits abstract desired trades."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from collections import deque
 from typing import Any
 
 from models.volatility import PortfolioGreeks, portfolio_greeks
 from volatility.config import VolatilityConfig
+from volatility.convergence import ConvergenceModel, features_for_straddle
 from volatility.forecast import ForecastResult, estimate_remaining_volatility
 from volatility.hedging import calculate_hedge_order
 from volatility.market_data import MarketState, from_snapshot
-from volatility.signals import OptionModel, ParityOpportunity, StraddleOpportunity, find_mispricings, model_options, scan_put_call_parity, select_atm_straddle
+from volatility.timing import exit_budget, order_capacity
+from volatility.signals import OptionModel, ParityOpportunity, StraddleOpportunity, find_mispricings, held_strike_edge, model_options, scan_put_call_parity, select_atm_straddle
 
 
 @dataclass(frozen=True)
@@ -151,7 +154,8 @@ class VolatilityStrategy:
     :param fallback_sigma: Explicit fallback for a heat with incomplete news.
     """
 
-    def __init__(self, config: VolatilityConfig | None = None, fallback_sigma: float | None = None) -> None:
+    def __init__(self, config: VolatilityConfig | None = None, fallback_sigma: float | None = None,
+                 convergence_model: ConvergenceModel | None = None) -> None:
         """Initialize an empty strategy-news cursor.
 
         :param config: Optional non-default strategy configuration.
@@ -160,7 +164,23 @@ class VolatilityStrategy:
 
         self.config = config or VolatilityConfig()
         self.fallback_sigma = fallback_sigma
+        self.convergence_model = convergence_model
+        self._convergence_prediction: float | None = None
         self._seen_news_ids: set[int | str | None] = set()
+        self._used_entry_news: frozenset[int | str | None] = frozenset()
+        self._last_tick: int | None = None
+        self._cycle_samples: deque[int] = deque(maxlen=32)
+        self._liquidating = False
+        self.timing: dict[str, Any] = {}
+
+    @property
+    def liquidating(self) -> bool:
+        """Report whether the current heat has entered mandatory liquidation.
+
+        :returns: True once the inventory-dependent deadline has been reached.
+        """
+
+        return self._liquidating
 
     def decide(self, snapshot: dict[str, Any]) -> StrategyDecision:
         """Model a snapshot and produce a bounded V1 action plan.
@@ -173,6 +193,23 @@ class VolatilityStrategy:
         """
 
         state = from_snapshot(snapshot)
+        if self._last_tick is not None:
+            if state.current_tick < self._last_tick:
+                self._cycle_samples.clear()
+                self._seen_news_ids.clear()
+                self._used_entry_news = frozenset()
+                self._liquidating = False
+            elif state.current_tick > self._last_tick:
+                self._cycle_samples.append(state.current_tick - self._last_tick)
+        self._last_tick = state.current_tick
+        cycle = max(self._cycle_samples, default=self.config.cycle_ticks_floor)
+        positions = {item.symbol: item.position for item in state.options if item.position}
+        budget = exit_budget(state, positions, cycle, self.config)
+        deadline = budget.liquidation_tick
+        if self.config.close_tick is not None:
+            deadline = min(deadline, self.config.close_tick)
+        self.timing = {**asdict(budget), "liquidation_tick": deadline}
+        self._liquidating = self._liquidating or state.current_tick >= deadline
         forecast = estimate_remaining_volatility(state.current_tick, self.config.expiry_tick, state.news_history,
                                                  state, self.fallback_sigma)
         if forecast.sigma is None:
@@ -184,20 +221,20 @@ class VolatilityStrategy:
         straddle = select_atm_straddle(models, opportunities, state)
         parity = scan_put_call_parity(models, state, self.config)
         news_ids = {item.get("news_id") for item in state.news_history}
-        new_news = bool(news_ids - self._seen_news_ids)
         self._seen_news_ids.update(news_ids)
         age = _time_since_latest_news(state)
         if state.status != "ACTIVE" or state.current_tick >= self.config.expiry_tick:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: case inactive or expired", age)
-        if state.current_tick >= self.config.close_tick:
-            closing = tuple(DesiredTrade(item.quote.symbol, -item.quote.position, "expiry inventory reduction")
+        if self._liquidating:
+            closing = tuple(DesiredTrade(item.quote.symbol, -max(-order_capacity(state, item.quote.symbol),
+                                             min(item.quote.position, order_capacity(state, item.quote.symbol))), "expiry inventory reduction")
                             for item in models if item.quote.position)
             if closing:
                 return StrategyDecision(state, forecast, models, portfolio, straddle, parity, closing,
                                         "exit: configured expiry window", age)
             if state.rtm_position:
                 return StrategyDecision(state, forecast, models, portfolio, straddle, parity,
-                                        (DesiredTrade("RTM", -state.rtm_position, "expiry RTM reduction"),),
+                                        (DesiredTrade("RTM", -max(-order_capacity(state, "RTM"), min(state.rtm_position, order_capacity(state, "RTM"))), "expiry RTM reduction"),),
                                         "exit: configured expiry window", age)
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
                                     "wait: configured expiry window blocks new entries", age)
@@ -208,22 +245,55 @@ class VolatilityStrategy:
         if hedge:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity,
                                     (DesiredTrade("RTM", hedge, "delta hedge"),), "hedge: outside no-trade band", age)
-        open_atm = [item for item in models if abs(item.quote.strike - state.rtm.mid) == min(abs(other.quote.strike - state.rtm.mid) for other in models)] if models else []
-        if any(item.quote.position for item in open_atm) and (straddle is None or straddle.expected_edge_per_contract < self.config.exit_edge_per_contract):
-            exits = tuple(DesiredTrade(item.quote.symbol, -item.quote.position, "straddle convergence exit")
-                          for item in open_atm if item.quote.position)
-            return StrategyDecision(state, forecast, models, portfolio, straddle, parity, exits, "exit: remaining edge below hysteresis threshold", age)
+        held_strikes = sorted({item.quote.strike for item in models if item.quote.position})
+        for strike in held_strikes:
+            held = tuple(item for item in models if item.quote.strike == strike and item.quote.position)
+            if held_strike_edge(held, self.config) < self.config.exit_edge_per_contract:
+                exits = tuple(DesiredTrade(item.quote.symbol, -item.quote.position, "straddle convergence exit")
+                              for item in held)
+                return StrategyDecision(state, forecast, models, portfolio, straddle, parity, exits,
+                                        "exit: remaining edge below hysteresis threshold", age)
         if any(item.quote.position for item in models):
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
                                     "wait: existing option inventory is being held and risk-managed", age)
-        if not new_news:
+        relevant_news = frozenset(forecast.recognized_news_ids)
+        relevant_ticks = [int(item["tick"]) for item in state.news_history
+                          if item.get("news_id") in relevant_news and "tick" in item]
+        news_age = state.current_tick - max(relevant_ticks) if relevant_ticks else None
+        if (not relevant_news or relevant_news == self._used_entry_news or news_age is None
+                or not 0 <= news_age <= self.config.news_entry_window_ticks):
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: no new analyst/news event", age)
         if straddle is None:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: ATM straddle lacks executable edge", age)
-        quantity = _size_for_edge(straddle, portfolio, state, self.config)
+        if self.convergence_model is not None:
+            call, put = straddle.call, straddle.put
+            quotes = {item.quote.symbol: item.quote.quote for item in models}
+            call_quote, put_quote = quotes[call.symbol], quotes[put.symbol]
+            features = features_for_straddle(straddle.expected_edge_per_contract, forecast.sigma,
+                                             call.market_iv, put.market_iv, age, state.current_tick,
+                                             call_quote.ask - call_quote.bid,
+                                             put_quote.ask - put_quote.bid)
+            self._convergence_prediction = self.convergence_model.predict(features)
+            if self._convergence_prediction < self.config.convergence_min_expected_pnl:
+                return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
+                                        "wait: learned convergence return is insufficient", age)
+        quantity = min(_size_for_edge(straddle, portfolio, state, self.config),
+                       order_capacity(state, straddle.call.symbol),
+                       order_capacity(state, straddle.put.symbol))
+        proposed = {straddle.call.symbol: quantity, straddle.put.symbol: quantity}
+        proposed_budget = exit_budget(state, proposed, cycle, self.config)
+        # Two entry cycles plus useful holding time must precede the exit window.
+        entry_deadline = proposed_budget.liquidation_tick - 2 * proposed_budget.ticks_per_order - self.config.minimum_holding_ticks
+        if self.config.close_tick is not None:
+            entry_deadline = min(entry_deadline, self.config.close_tick - 2 * proposed_budget.ticks_per_order - self.config.minimum_holding_ticks)
+        self.timing.update(entry_deadline_tick=entry_deadline, proposed_exit_budget=asdict(proposed_budget))
+        if state.current_tick >= entry_deadline:
+            return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
+                                    "wait: insufficient time to enter, hold, and liquidate", age)
         signed = quantity if straddle.side == "BUY" else -quantity
         if quantity == 0:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: straddle edge below entry threshold", age)
+        self._used_entry_news = relevant_news
         return StrategyDecision(state, forecast, models, portfolio, straddle, parity,
                                 (DesiredTrade(straddle.call.symbol, signed, "ATM volatility straddle"),
                                  DesiredTrade(straddle.put.symbol, signed, "ATM volatility straddle")),
@@ -262,6 +332,7 @@ class VolatilityStrategy:
                 "recognized_news_ids": decision.forecast.recognized_news_ids,
                 "unparsed_news_ids": decision.forecast.unparsed_news_ids,
                 "time_since_latest_news_ticks": decision.time_since_latest_news,
+                "entry_window_ticks": self.config.news_entry_window_ticks,
             },
             "risk_factors": {
                 "portfolio_delta": decision.portfolio.delta,
@@ -269,9 +340,18 @@ class VolatilityStrategy:
                 "portfolio_vega": decision.portfolio.vega,
                 "hedge_threshold": self.config.hedge_threshold,
                 "max_safe_delta": self.config.max_safe_delta,
-                "expiry_reduction_tick": self.config.close_tick,
+                "expiry_reduction_tick": self.timing.get("liquidation_tick"),
+                "execution_timing": dict(self.timing),
             },
             "entry_factors": entry,
+            "convergence_model": None if self.convergence_model is None else {
+                "expected_pnl_per_straddle": self._convergence_prediction,
+                "minimum_expected_pnl": self.config.convergence_min_expected_pnl,
+                "horizon_ticks": self.convergence_model.horizon_ticks,
+                "training_samples": self.convergence_model.training_samples,
+                "holdout_mae": self.convergence_model.holdout_mae,
+                "holdout_directional_accuracy": self.convergence_model.holdout_directional_accuracy,
+            },
             "selected_trades": [trade.__dict__ for trade in decision.desired_trades],
             "cost_assumptions": {
                 "option_commission": self.config.option_commission,

@@ -1,6 +1,7 @@
 """RIT transport. Mutations are never retried automatically."""
 import base64
 import json
+from http.client import HTTPException
 import os
 import time
 from typing import Any
@@ -58,14 +59,17 @@ class Client:
                     body = response.read()
                     return json.loads(body) if body else {}
             except HTTPError as error:
-                if method != "GET" or error.code != 429 or attempt == 2:
-                    raise RuntimeError(f"RIT {method} {endpoint}: HTTP {error.code}") from None
+                retryable = method == "GET" and error.code in (408, 429, 500, 502, 503, 504)
+                if not retryable:
+                    raise RITTransportError(f"RIT {method} {endpoint}: HTTP {error.code}") from None
+                if attempt == 2:
+                    raise RITReadError(f"RIT GET {endpoint}: HTTP {error.code} after 3 attempts") from None
                 try:
                     delay = float(error.headers.get("Retry-After", "1"))
                 except ValueError:
                     delay = 1
                 time.sleep(max(0.1, min(delay, 10)))
-            except (OSError, TimeoutError, URLError) as error:
+            except (OSError, HTTPException, ValueError) as error:
                 if method != "GET":
                     raise RITTransportError(f"RIT {method} {endpoint}: transport failure") from error
                 if attempt == 2:

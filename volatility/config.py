@@ -24,7 +24,12 @@ class VolatilityConfig:
     :param max_portfolio_gamma: Internal cap on absolute portfolio gamma.
     :param max_portfolio_vega: Internal cap on absolute portfolio vega.
     :param edge_for_full_risk: Net edge that earns the full available risk budget.
-    :param close_tick: Tick at which V1 starts reducing inventory for expiry.
+    :param news_entry_window_ticks: Maximum release age for reevaluating an unused news signal.
+    :param convergence_min_expected_pnl: Minimum learned expected P&L per straddle to enter.
+    :param close_tick: Optional operator override forcing an earlier liquidation.
+    :param cycle_ticks_floor: Conservative startup ticks per complete decision/order cycle.
+    :param liquidation_buffer_ticks: Extra ticks reserved for transient API delays.
+    :param minimum_holding_ticks: Time a new position must have before liquidation.
     :param safety_margin_per_contract: Additional edge required for model and fill error.
     :param explainability_enabled: Include factor-level rationale in decision logs.
     """
@@ -44,7 +49,12 @@ class VolatilityConfig:
     max_portfolio_gamma: float = 1500.0
     max_portfolio_vega: float = 80000.0
     edge_for_full_risk: float = 32.0
-    close_tick: int = 240
+    news_entry_window_ticks: int = 10
+    convergence_min_expected_pnl: float = 0.0
+    close_tick: int | None = None
+    cycle_ticks_floor: int = 3
+    liquidation_buffer_ticks: int = 5
+    minimum_holding_ticks: int = 10
     safety_margin_per_contract: float = 1.0
     explainability_enabled: bool = True
 

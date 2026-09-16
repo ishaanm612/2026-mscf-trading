@@ -68,6 +68,7 @@ class Executor:
         A request timeout does NOT imply rejection. Leaving an unresolved intent
         in the journal prevents an accidental duplicate order after restart.
         """
+        started = time.monotonic()
         self.log("intent", ticker=ticker, quantity=quantity)
         result = self.client.request("POST", "orders", ticker=ticker, type="MARKET",
                                      action="BUY" if quantity > 0 else "SELL", quantity=abs(quantity))
@@ -76,7 +77,8 @@ class Executor:
         for _ in range(12):
             order = self.client.get(f"orders/{order_id}")
             if order["quantity_filled"] == abs(quantity) and order["status"] != "OPEN":
-                self.log("filled", order_id=order_id, quantity=quantity)
+                self.log("filled", order_id=order_id, ticker=ticker, quantity=quantity,
+                         duration_seconds=time.monotonic() - started, order=dict(order))
                 return order
             if order["status"] != "OPEN":
                 self.log("incomplete", order_id=order_id, filled=order["quantity_filled"])

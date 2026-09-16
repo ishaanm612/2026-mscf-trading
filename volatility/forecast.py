@@ -149,21 +149,18 @@ def estimate_remaining_volatility(current_time: int, expiry_time: int, news_hist
         return ForecastResult(None, None, regimes, recognized, unparsed)
     if current_time >= expiry_time:
         return ForecastResult(0.0, 0.0, regimes, recognized, unparsed)
-    total, cursor, latest = 0.0, current_time, fallback_sigma * fallback_sigma if fallback_sigma is not None else None
-    for regime in sorted(regimes, key=lambda item: (item.start_tick, item.end_tick)):
-        if regime.end_tick <= current_time:
-            continue
-        start, end = max(cursor, regime.start_tick), min(expiry_time, regime.end_tick)
-        if cursor < start:
+    # Regimes are in publication order. Resolve overlaps before integration:
+    # the newest applicable announcement wins, including a midweek revision.
+    latest = fallback_sigma * fallback_sigma if fallback_sigma is not None else None
+    total = 0.0
+    for tick in range(expiry_time):
+        applicable = next((regime for regime in reversed(regimes)
+                           if regime.start_tick <= tick < regime.end_tick), None)
+        if applicable is not None:
+            latest = applicable.variance
+        if tick >= current_time:
             if latest is None:
                 return ForecastResult(None, None, regimes, recognized, unparsed)
-            total += (start - cursor) * latest
-        if start < end:
-            total += (end - start) * regime.variance
-            cursor, latest = end, regime.variance
-    if cursor < expiry_time:
-        if latest is None:
-            return ForecastResult(None, None, regimes, recognized, unparsed)
-        total += (expiry_time - cursor) * latest
+            total += latest
     duration = expiry_time - current_time
     return ForecastResult(math.sqrt(total / duration), total, regimes, recognized, unparsed)

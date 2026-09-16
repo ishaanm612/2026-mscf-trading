@@ -4,9 +4,12 @@ from dataclasses import replace
 from typing import Any, Mapping
 
 from models import etf, volatility, news
+from client import RITReadError
 import risk
 from volatility.config import VolatilityConfig
+from volatility.convergence import ConvergenceModel
 from volatility.strategy import DesiredTrade, VolatilityStrategy
+from volatility.signals import find_mispricings
 
 
 def clip(position: float, size: int) -> int:
@@ -18,7 +21,7 @@ class Bot:
     def __init__(self, client: Any, executor: Any = None, *, case: str, sigma: float | None = None,
                  rate: float = 0.0, quantity: int = 1000, gross_limit: int | None = None,
                  net_limit: int | None = None, flatten_only: bool = False, basket: bool = False,
-                 explainability: bool = True) -> None:
+                 explainability: bool = True, convergence_model_path: str | None = None) -> None:
         """Create a case bot and its pure volatility decision controller.
 
         :param client: RIT client used only when execution is enabled.
@@ -40,9 +43,12 @@ class Bot:
         self.held_basket = None
         self.last_tick = None
         self.last_period = None
+        convergence_model = ConvergenceModel.load(convergence_model_path) if convergence_model_path else None
         self.volatility_strategy = VolatilityStrategy(replace(VolatilityConfig(), risk_free_rate=rate,
-                                                              explainability_enabled=explainability), sigma)
+                                                              explainability_enabled=explainability), sigma,
+                                                   convergence_model)
         self.pending_volatility_trades: list[DesiredTrade] = []
+        self.expected_volatility_positions: dict[str, float] | None = None
 
     def submit(self, snapshot: Mapping[str, Any], ticker: str, quantity: int, reason: str,
                deltas: Mapping[str, float] | None = None) -> dict[str, Any]:
@@ -57,13 +63,35 @@ class Bot:
         """
         risk.check(snapshot, ticker, quantity, self.case, deltas, self.gross_limit, self.net_limit)
         action = {"ticker": ticker, "quantity": quantity, "reason": reason}
+        if self.executor and self.case == "volatility":
+            try:
+                fresh = self.client.snapshot("volatility", trading=True)
+            except RITReadError:
+                self.pending_volatility_trades.clear()
+                self.expected_volatility_positions = None
+                return {"wait": "account preflight unavailable; retry with fresh state"}
+            old_positions = self.position_map(snapshot)
+            if fresh.get("orders") != [] or self.position_map(fresh) != old_positions:
+                self.pending_volatility_trades.clear()
+                self.expected_volatility_positions = None
+                return {"wait": "account changed before submission; replan from confirmed positions"}
+            risk.check(fresh, ticker, quantity, self.case, deltas, self.gross_limit, self.net_limit)
         if self.executor:
             # Re-read case immediately before mutation; do not trade an older snapshot.
-            current = self.client.get("case")
+            try:
+                current = self.client.get("case")
+            except RITReadError:
+                if self.case != "volatility":
+                    raise
+                self.pending_volatility_trades.clear()
+                return {"wait": "case preflight unavailable; replan before submission"}
             old = snapshot["case"]
             if (current["status"] != "ACTIVE" or current.get("period") != old.get("period")
                     or not 0 <= current["tick"] - old["tick"] <= 2 or current["tick"] >= 299):
-                raise RuntimeError("Snapshot expired before submission")
+                if self.case != "volatility":
+                    raise RuntimeError("Snapshot expired before submission")
+                self.pending_volatility_trades.clear()
+                return {"wait": "snapshot expired before submission; replan from fresh state"}
             self.executor.order(ticker, quantity)
         return action
 
@@ -79,9 +107,27 @@ class Bot:
         self.last_tick, self.last_period = state["tick"], state.get("period")
         if state["status"] != "ACTIVE" or state["tick"] >= 299:
             return {"wait": "inactive or final tick"}
-        if snapshot.get("orders") != []:
-            raise RuntimeError("Existing open orders must be reconciled before running the bot")
+        if not isinstance(snapshot.get("orders"), list):
+            raise RuntimeError("Missing or invalid open-order state")
+        if snapshot["orders"]:
+            if self.case != "volatility":
+                raise RuntimeError("Existing open orders must be reconciled before running the bot")
+            self.pending_volatility_trades.clear()
+            self.expected_volatility_positions = None
+            return {"wait": "open account orders; waiting for fills or cancellation",
+                    "open_order_ids": [order.get("order_id") for order in snapshot["orders"]]}
+
         return self.volatility_step(snapshot) if self.case == "volatility" else self.etf_step(snapshot)
+
+    @staticmethod
+    def position_map(snapshot: Mapping[str, Any]) -> dict[str, float]:
+        """Extract account inventory for detecting fills outside this bot.
+
+        :param snapshot: Account snapshot with confirmed security positions.
+        :returns: Instrument quantities without assuming who placed the orders.
+        """
+
+        return {str(row["ticker"]): float(row["position"]) for row in snapshot["securities"]}
 
     def volatility_step(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         """Execute at most one validated V1 volatility action from a fresh decision.
@@ -90,26 +136,65 @@ class Bot:
         :returns: Submitted action or an explainable no-trade decision.
         """
 
+        actual_positions = self.position_map(snapshot)
+        if (self.expected_volatility_positions is not None
+                and actual_positions != self.expected_volatility_positions):
+            self.pending_volatility_trades.clear()
+        self.expected_volatility_positions = actual_positions.copy()
         decision = self.volatility_strategy.decide(dict(snapshot))
         decision_fields = decision.as_log_fields()
         decision_fields["explanation"] = self.volatility_strategy.explain(decision)
         securities = {str(item["ticker"]): item for item in snapshot["securities"]}
         deltas = {"RTM": 1.0, **{item.quote.symbol: 100.0 * item.fair.delta for item in decision.models}}
+        if self.volatility_strategy.liquidating:
+            # Discard pending entry legs once the inventory exit deadline arrives.
+            self.pending_volatility_trades.clear()
         if self.flatten_only:
             self.pending_volatility_trades = [DesiredTrade(symbol, -int(row["position"]), "flatten option")
                                               for symbol, row in securities.items()
                                               if symbol != "RTM" and row.get("position", 0)]
             if not self.pending_volatility_trades and securities["RTM"].get("position", 0):
                 self.pending_volatility_trades = [DesiredTrade("RTM", -int(securities["RTM"]["position"]), "flatten RTM")]
-        if not self.pending_volatility_trades:
-            self.pending_volatility_trades.extend(decision.desired_trades)
-        if not self.pending_volatility_trades:
-            return {"wait": decision.reason, "decision": decision_fields}
-        trade = self.pending_volatility_trades.pop(0)
+        priority_hedge = decision.reason.startswith("hedge:") and not self.flatten_only
+        if priority_hedge:
+            # Interrupt the pair, preserving the remaining leg for fresh validation.
+            trade = decision.desired_trades[0]
+        else:
+            if self.pending_volatility_trades and self.pending_volatility_trades[0].reason == "ATM volatility straddle":
+                pending = self.pending_volatility_trades[0]
+                side = "BUY" if pending.quantity > 0 else "SELL"
+                opportunities = find_mispricings(decision.models, decision.forecast.sigma or 0.0,
+                                                  self.volatility_strategy.config)
+                valid = any(item.symbol == pending.symbol and item.side == side for item in opportunities)
+                if not valid or decision.reason.startswith("exit:"):
+                    self.pending_volatility_trades.clear()
+                    # The pair's thesis no longer supports completing the second
+                    # leg. Explicitly unwind the confirmed first leg instead.
+                    self.pending_volatility_trades.extend(
+                        DesiredTrade(item.quote.symbol, -item.quote.position, "aborted straddle unwind")
+                        for item in decision.models if item.quote.position)
+            if not self.pending_volatility_trades:
+                self.pending_volatility_trades.extend(decision.desired_trades)
+            if not self.pending_volatility_trades:
+                return {"wait": decision.reason, "decision": decision_fields}
+            trade = self.pending_volatility_trades.pop(0)
         if trade.quantity == 0:
             return {"wait": decision.reason, "decision": decision_fields}
         reason = "volatility mispricing" if trade.reason == "ATM volatility straddle" else trade.reason
-        action = self.submit(snapshot, trade.symbol, trade.quantity, reason, deltas)
+        try:
+            action = self.submit(snapshot, trade.symbol, trade.quantity, reason, deltas)
+        except risk.RiskError as error:
+            # All RiskError gates run before Executor.order: no mutation occurred.
+            # Discard dependent legs and let the next fresh decision hedge or exit.
+            self.pending_volatility_trades.clear()
+            rejection = {"symbol": trade.symbol, "quantity": trade.quantity,
+                         "reason": str(error), "submitted": False}
+            decision_fields["risk_rejection"] = rejection
+            decision_fields["reason"] = "wait: pre-trade risk rejection"
+            return {"wait": "pre-trade risk rejection; replan from fresh state",
+                    "risk_rejection": rejection, "decision": decision_fields}
+        if self.executor and "ticker" in action:
+            self.expected_volatility_positions[trade.symbol] += trade.quantity
         action["decision"] = decision_fields
         return action
 

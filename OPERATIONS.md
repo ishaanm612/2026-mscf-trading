@@ -73,7 +73,7 @@ current worker.
 4. `risk.check` verifies order size, tradeability, local projected risk, and projected server limits using security limit bindings. Existing open orders block new ones.
 5. `Executor` persists an intent, submits once, and polls the returned order ID. Only a complete terminal fill allows the next action.
 
-Snapshots are not atomic. No other trader or program should change this account while the bot runs. Market orders can execute away from observed quotes; conservative thresholds reduce this risk but cannot eliminate it.
+Snapshots are not atomic. Volatility click trading can change the account while the bot runs; the worker waits for open orders and replans from confirmed inventory. ETF execution still requires exclusive account use. Market orders can execute away from observed quotes; conservative thresholds reduce this risk but cannot eliminate it.
 
 ## Volatility decisions and units
 
@@ -113,3 +113,102 @@ python3 run.py volatility --plan --sigma 0.25
 ```
 
 Tests exercise pricing identities, actual news formats, inverse risk-unit weights, tender unwinds, partial/uncertain fills, and a mocked 300-tick volatility round. The mock verifies behavior, not market realism or profitability. Local recordings are ignored by Git. Replay recalculates signals; it is not a fills/P&L backtester.
+
+### Adaptive volatility deadlines
+
+Volatility now computes the entry and liquidation deadlines from confirmed
+inventory, server child-order limits, and recent observed decision-cycle tick
+gaps. It no longer stops by default at tick 240. Defaults and optional earlier
+`close_tick` override live in `volatility/config.py`; formulas and assumptions
+are documented in `volatility/DESIGN.md` under inventory-dependent expiry timing.
+The decision explanation's `risk_factors.execution_timing` records the budget.
+These changes apply when a new worker starts; they do not hot-reload a worker.
+
+### Volatility click trading
+
+Open UI orders pause new bot submissions until they fill or are cancelled.
+The bot never cancels UI orders. A resting limit order therefore keeps it
+paused, including automated hedges; close or cancel that UI order to resume.
+Confirmed manual fills become portfolio inventory that the strategy can hedge
+or exit under its normal rules. They are not exempt from risk management.
+
+Pending strategy legs are discarded when account quantities differ from the
+expected result of the bot's last confirmed fill, or open orders are observed.
+A second account snapshot before submission catches concurrent UI activity.
+There remains a race between the last read and submission because the API does
+not provide an atomic account lock. Uncertain or partial fills of the bot's
+own orders still halt for journal reconciliation; this feature does not bypass
+that safeguard. Account waits are recorded as execution_wait events.
+
+### Rejected volatility candidates
+
+A local or fresh-account pre-trade RiskError is an ordinary no-trade result.
+The worker logs `risk_rejection` (symbol, signed quantity, rejection reason,
+and `submitted: false`), drops dependent queued legs, and replans on the next
+snapshot. Fresh hedge decisions take precedence over queued option legs.
+Expired snapshots and failed read-only final case checks also return waits.
+Persistent constraints may continue to block trading; the bot never weakens
+limits to force an order through. Unknown outcomes after submission and partial
+fills still halt through the execution journal; these are not retried.
+
+### Worker failure policy
+
+During --watch, rejected volatility candidates and known transient snapshot
+failures are recoverable waits. GET retries include 408/429/500/502/503/504,
+connection/protocol failures, and malformed JSON, with three bounded attempts.
+Authentication/configuration errors are not endlessly retried as transient errors.
+
+Any unexpected cycle failure, including an ambiguous execution outcome, latches
+the runner into read-only mode. It continues account polling and health output,
+records a worker_halted event when logging is available, and does not call the
+strategy again. This halt survives market resets in the running process. Stop
+the worker, inspect the account and journal, resolve outstanding execution, and
+explicitly restart after recovery. Never clear an execution journal to bypass
+an unresolved intent. The supervisor does not start a second worker while the
+halted worker remains alive.
+
+This runtime policy does not bypass startup validation: an occupied journal
+lock, unresolved prior intent, or invalid startup configuration still prevents
+trading startup. Process termination and unavailable stdout/disk can also stop
+the worker; keeping the process alive is not a guarantee of trading availability.
+
+Paired-leg update: hedges now preserve pending option legs for revalidation.
+Watched volatility trading immediately requests fresh state between option
+fills, rather than sleeping the normal polling interval. Unused analyst news
+is eligible for a configurable ten-tick post-publication entry window.
+Execution journals now include the returned filled order and elapsed execution
+seconds. Restart is required to load these changes; they do not hot-reload.
+
+### Supervised convergence filter
+
+Train a candidate model from recorded decisions after several complete heats:
+
+```sh
+python3 -m analysis.convergence data/volatility-decisions.jsonl \
+  --output data/convergence-model.json --horizon 10
+```
+
+The trainer labels each candidate with the executable bid/ask outcome ten or
+more ticks later, trains only on earlier complete heats, and reports mean
+absolute error and directional accuracy on the final three heats. It does not
+reconstruct actual fills, hedges, or counterfactual P&L.
+
+Use a reviewed model explicitly; it remains disabled unless passed to the
+runner:
+
+```sh
+python3 run.py volatility --source api --plan --watch \
+  --convergence-model data/convergence-model.json
+```
+
+The filter can only reject entries. It never overrides forecast parsing, risk,
+hedging, exits, or execution confirmation. Logs include its prediction,
+horizon, training count, and holdout metrics.
+
+### Console decision log
+
+Volatility `--plan` and `--trade` output one readable line per cycle, for
+example `tick 37 | WAIT | BUY 50 straddle edge $18.40 | fair IV 31.00% |
+delta +422 | wait: existing option inventory is being held and risk-managed`.
+The full all-option record remains in `--decision-log` for replay and model
+training. Pass `--verbose` only when inspecting the raw JSON payload.

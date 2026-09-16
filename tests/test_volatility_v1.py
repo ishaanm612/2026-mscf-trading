@@ -65,6 +65,95 @@ class VolatilityV1Tests(unittest.TestCase):
         self.assertEqual(decision.desired_trades, ())
         self.assertEqual(decision.reason, "wait: configured expiry window blocks new entries")
 
+    def test_latest_announcement_replaces_range_and_midweek_revision(self) -> None:
+        """Prefer new information only for its applicable interval, without lookahead."""
+
+        news = [
+            {"news_id": 1, "tick": 1, "body": "Current volatility is 40%."},
+            {"news_id": 2, "tick": 36, "body": "Volatility next week is between 31% and 36%."},
+            {"news_id": 3, "tick": 75, "body": "Volatility this week is 35%."},
+            {"news_id": 4, "tick": 90, "body": "Volatility this week is 30%."},
+        ]
+        self.assertAlmostEqual(estimate_remaining_volatility(75, 300, reversed(news)).sigma, .35)
+        self.assertAlmostEqual(estimate_remaining_volatility(89, 300, news).sigma, .35)
+        self.assertAlmostEqual(estimate_remaining_volatility(90, 300, news).sigma, .30)
+        self.assertAlmostEqual(estimate_remaining_volatility(151, 300, news).sigma, .30)
+
+    def test_exits_actual_strike_when_signal_reverses(self) -> None:
+        """Close long and short inventory even when another strike becomes ATM."""
+
+        for position, sigma in ((10, .10), (-10, .40)):
+            for spot in (50.0, 51.0):
+                with self.subTest(position=position, spot=spot):
+                    snapshot = demo("volatility")
+                    snapshot["securities"][0].update(bid=spot-.01, ask=spot+.01)
+                    for row in snapshot["securities"]:
+                        if row["ticker"] in {"RTM50C", "RTM50P"}:
+                            row["position"] = position
+                    decision = VolatilityStrategy(fallback_sigma=sigma).decide(snapshot)
+                    self.assertEqual({t.symbol: t.quantity for t in decision.desired_trades},
+                                     {"RTM50C": -position, "RTM50P": -position})
+
+    def test_exit_budget_scales_with_inventory_and_delays(self) -> None:
+        """Move liquidation earlier for more children or slower observed cycles."""
+
+        from volatility.market_data import from_snapshot
+        from volatility.timing import exit_budget
+        state = from_snapshot(demo("volatility"))
+        config = VolatilityConfig()
+        small = exit_budget(state, {"RTM50C": 69, "RTM50P": 69}, 2, config)
+        large = exit_budget(state, {"RTM50C": 250, "RTM50P": 250}, 2, config)
+        slow = exit_budget(state, {"RTM50C": 69, "RTM50P": 69}, 6, config)
+        self.assertGreater(small.liquidation_tick, 240)
+        self.assertLess(large.liquidation_tick, small.liquidation_tick)
+        self.assertLess(slow.liquidation_tick, small.liquidation_tick)
+
+    def test_late_entry_reserves_full_lifecycle(self) -> None:
+        """Allow post-240 entries with enough time, then reject insufficient runway."""
+
+        snapshot = demo("volatility")
+        snapshot["news"] = [{"news_id": 1, "tick": 240, "body": "Volatility this week is 100%."}]
+        snapshot["case"]["tick"] = 241
+        self.assertTrue(VolatilityStrategy().decide(snapshot).desired_trades)
+        snapshot["case"]["tick"] = 290
+        snapshot["news"][0]["tick"] = 290
+        decision = VolatilityStrategy().decide(snapshot)
+        self.assertFalse(decision.desired_trades)
+        self.assertIn("insufficient time", decision.reason)
+
+    def test_liquidation_latches_and_chunks_large_positions(self) -> None:
+        """Keep reducing after inventory shrinks and respect server child sizes."""
+
+        snapshot = demo("volatility")
+        snapshot["case"]["tick"] = 268
+        snapshot["securities"][1]["position"] = 250
+        strategy = VolatilityStrategy(fallback_sigma=.3)
+        decision = strategy.decide(snapshot)
+        self.assertEqual(decision.desired_trades[0].quantity, -100)
+        snapshot["case"]["tick"] = 269
+        snapshot["securities"][1]["position"] = 50
+        decision = strategy.decide(snapshot)
+        self.assertEqual(decision.desired_trades[0].quantity, -50)
+        self.assertEqual(decision.reason, "exit: configured expiry window")
+
+    def test_news_window_rechecks_quotes_without_reentering(self) -> None:
+        """Retain an unused news event for a short window and consume it on entry."""
+
+        snapshot = demo("volatility")
+        snapshot["news"] = [{"news_id": 1, "tick": 1, "body": "Current volatility is 25%."}]
+        snapshot["case"]["tick"] = 1
+        strategy = VolatilityStrategy()
+        original = [dict(row) for row in snapshot["securities"]]
+        for row in snapshot["securities"][1:]:
+            row.update(bid=0, ask=10)
+        self.assertFalse(strategy.decide(snapshot).desired_trades)
+        snapshot["securities"] = original
+        snapshot["case"]["tick"] = 2
+        self.assertTrue(strategy.decide(snapshot).desired_trades)
+        self.assertFalse(strategy.decide(snapshot).desired_trades)
+        snapshot["case"]["tick"] = 20
+        self.assertFalse(VolatilityStrategy().decide(snapshot).desired_trades)
+
     def test_explainable_log_generates_reaction_chart(self) -> None:
         """Persist factors and render the offline market-maker convergence SVG."""
 
