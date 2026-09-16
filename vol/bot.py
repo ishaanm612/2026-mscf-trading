@@ -75,7 +75,7 @@ def portfolio_delta(spot, years, rate, sigma, options, rtm_position):
     return delta
 
 
-def weave(legs, rtm_quantity=0):
+def weave(legs, rtm_quantity=0, book_net=0):
     """Chunk a multi-leg trade round-robin so delta stays near zero mid-way.
 
     legs are (symbol, signed quantity to trade). Options go out 100 contracts
@@ -85,13 +85,17 @@ def weave(legs, rtm_quantity=0):
     """
     legs = [[symbol, quantity] for symbol, quantity in legs if quantity]
     rounds = max(((abs(q) + MAX_OPT_ORDER - 1) // MAX_OPT_ORDER for _, q in legs), default=0)
-    trades, rtm_left = [], rtm_quantity
+    trades, rtm_left, net = [], rtm_quantity, book_net
     for i in range(rounds):
-        for leg in legs:
+        # Within each round, send the chunks that move net toward zero FIRST.
+        # At net -1000 the server 400-rejects any sell before a buy has made
+        # room -- alphabetical ordering deadlocked a whole exit on that.
+        for leg in sorted(legs, key=lambda l: 0 if l[1] * net < 0 else 1):
             chunk = max(-MAX_OPT_ORDER, min(MAX_OPT_ORDER, leg[1]))
             if chunk:
                 trades.append((leg[0], chunk))
                 leg[1] -= chunk
+                net += chunk
         share = max(-MAX_RTM_ORDER, min(MAX_RTM_ORDER, round(rtm_left / (rounds - i))))
         if share:
             trades.append(("RTM", share))
@@ -115,9 +119,15 @@ def submit(client, ticker, quantity, dry_run, lines):
         if dry_run:
             lines.append(f"  DRY-RUN would send: {action} {chunk} {ticker} @ market")
         else:
-            client.request("POST", "orders", ticker=ticker, type="MARKET",
-                           action=action, quantity=chunk)
-            lines.append(f"  sent: {action} {chunk} {ticker} @ market")
+            try:
+                client.request("POST", "orders", ticker=ticker, type="MARKET",
+                               action=action, quantity=chunk)
+                lines.append(f"  sent: {action} {chunk} {ticker} @ market")
+            except RuntimeError as error:
+                # A rejected order executed nothing; skip it and keep going.
+                # One refused chunk must never freeze the rest of a sequence
+                # (an exit deadlocked on this, leaving the book unhedged).
+                lines.append(f"  REJECTED {action} {chunk} {ticker}: {error} -- skipping")
         remaining -= chunk
         time.sleep(0.05)
 
@@ -218,7 +228,7 @@ def process_tick(client, dry_run, decisions_path, market_path):
             # Close every option leg AND the RTM hedge, woven together so the
             # book is never one-legged mid-unwind (heat 1 and 3 fine source).
             trades = weave([(o["symbol"], -o["position"]) for o in options if o["position"]],
-                           -rtm_position)
+                           -rtm_position, book_net=net)
         elif abs(delta) >= HEDGE_TRIGGER:
             # Hedge the FULL delta (submit() splits it into 10k-share orders);
             # capping at one order per tick let big strike-crossing delta flips
