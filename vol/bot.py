@@ -95,7 +95,7 @@ def submit(client, ticker, quantity, dry_run, lines):
         time.sleep(0.05)
 
 
-def process_tick(client, dry_run, log_path):
+def process_tick(client, dry_run, decisions_path, market_path):
     """Read the market, print one explained decision block, act on it.
 
     Decision priority, first match wins:
@@ -110,7 +110,16 @@ def process_tick(client, dry_run, log_path):
     case = client.get("case")
     tick, status = int(case["tick"]), str(case["status"])
     securities = client.get("securities")
-    info = parse_news(client.get("news"))
+    raw_news = client.get("news")
+    info = parse_news(raw_news)
+
+    # Record the raw market FIRST, before any decision logic can fail: with
+    # every security row (quotes, positions, realized/unrealized P&L, nlv)
+    # and the verbatim news text, a heat can be fully replayed offline to
+    # calibrate the parser, the MM's convergence speed, and realized vol.
+    with market_path.open("a") as market_log:
+        market_log.write(json.dumps({"time": time.time(), "case": case,
+                                     "securities": securities, "news": raw_news}) + "\n")
 
     rtm = next(s for s in securities if s["ticker"] == "RTM")
     spot = (float(rtm["bid"]) + float(rtm["ask"])) / 2.0
@@ -128,6 +137,7 @@ def process_tick(client, dry_run, log_path):
         lines.append(f"  !! UNPARSED vol news (check template): {headline}")
 
     decision, trades = "wait", []
+    metrics = {}  # everything worth studying after the session
     gross = sum(abs(o["position"]) for o in options)
     net = sum(o["position"] for o in options)
 
@@ -148,6 +158,10 @@ def process_tick(client, dry_run, log_path):
         buy_edge = (fair - (call["ask"] + put["ask"])) * MULT - COST_RESERVE
         sell_edge = ((call["bid"] + put["bid"]) - fair) * MULT - COST_RESERVE
         delta = portfolio_delta(spot, years, rate, sigma, options, rtm_position)
+        metrics = {"atm_strike": strike, "call_iv": call_iv, "put_iv": put_iv,
+                   "market_iv": market_iv, "iv_gap": market_iv - sigma if market_iv else None,
+                   "fair_straddle": fair, "buy_edge": buy_edge, "sell_edge": sell_edge,
+                   "delta": delta}
         lines.append(f"  forecast σ {sigma:.1%} | ATM K={strike:g} MM IV {market_iv:.1%}"
                      if market_iv else f"  forecast σ {sigma:.1%} | ATM K={strike:g} MM IV n/a")
         lines.append(f"  straddle fair ${fair:.2f} vs mkt {call['bid'] + put['bid']:.2f}/{call['ask'] + put['ask']:.2f}"
@@ -192,11 +206,12 @@ def process_tick(client, dry_run, log_path):
     for ticker, quantity in trades:
         submit(client, ticker, quantity, dry_run, lines)
     print("\n".join(lines), flush=True)
-    with log_path.open("a") as log:
-        log.write(json.dumps({"tick": tick, "status": status, "spot": spot, "sigma": sigma,
-                              "news": {k: v for k, v in info.items() if k != "unparsed"},
+    with decisions_path.open("a") as log:
+        log.write(json.dumps({"time": time.time(), "tick": tick, "status": status,
+                              "spot": spot, "sigma": sigma, "news": info,
                               "gross": gross, "net": net, "rtm": rtm_position,
-                              "decision": decision, "trades": trades}) + "\n")
+                              "decision": decision, "trades": trades,
+                              "dry_run": dry_run, **metrics}) + "\n")
     return tick, len(info["exact"]) + len(info["ranges"])
 
 
@@ -205,9 +220,16 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="explain decisions but send no orders")
     args = parser.parse_args()
     client = Client()
-    log_path = Path(__file__).parent / "logs" / "decisions.jsonl"
-    log_path.parent.mkdir(exist_ok=True)
-    print(f"volatility bot starting ({'DRY RUN' if args.dry_run else 'LIVE'}), logging to {log_path}")
+    # One timestamped pair of files per run, so separate heats never mix:
+    # decisions-*.jsonl is what the bot thought; market-*.jsonl is the full
+    # raw recording (replayable with review.py and shareable as calibration
+    # data -- it contains positions/P&L but no names).
+    logs = Path(__file__).parent / "logs"
+    logs.mkdir(exist_ok=True)
+    tag = time.strftime("%Y%m%d-%H%M%S")
+    decisions_path, market_path = logs / f"decisions-{tag}.jsonl", logs / f"market-{tag}.jsonl"
+    print(f"volatility bot starting ({'DRY RUN' if args.dry_run else 'LIVE'})\n"
+          f"  decisions -> {decisions_path}\n  recording -> {market_path}")
     last = None
     try:
         while True:
@@ -216,7 +238,7 @@ def main():
                 news_count = len(client.get("news"))
                 current = (case["tick"], case["period"], news_count)
                 if current != last:
-                    process_tick(client, args.dry_run, log_path)
+                    process_tick(client, args.dry_run, decisions_path, market_path)
                     last = current
             except (RuntimeError, OSError) as error:
                 print(f"  transient error, retrying: {error}", flush=True)

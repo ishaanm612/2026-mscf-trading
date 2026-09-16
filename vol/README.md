@@ -39,7 +39,26 @@ inside the penalty band by trading RTM shares.
   ...
 ```
 
-Every processed tick is also appended to `logs/decisions.jsonl` for replay.
+Every run writes two timestamped files under `logs/`:
+
+- `decisions-<ts>.jsonl` — what the bot thought each tick: forecast σ, ATM
+  IVs, IV gap, edges, delta, the decision string, and any trades sent.
+- `market-<ts>.jsonl` — the **full raw recording**: every security row
+  (quotes, positions, realized/unrealized, nlv) plus the verbatim news.
+  Written before any decision logic runs, so it survives bot crashes.
+  This is the shared calibration data; it contains no names.
+
+After a session, mine the recording:
+
+```bash
+python3 review.py logs/market-<timestamp>.jsonl
+```
+
+`review.py` prints: every news message verbatim with how the parser read it
+(anything `!! UNPARSED` means fix `news.py`), whether the MM was stale at the
+start, the MM's IV convergence speed after each announcement (tune
+`CONVERGED_IV` and exit timing from this), realized vol per week vs announced
+(gamma check), and the P&L trajectory with per-instrument attribution.
 
 ## Decision priority (in `process_tick`)
 
