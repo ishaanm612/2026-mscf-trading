@@ -32,12 +32,22 @@ MAX_RTM_ORDER = 10000 # shares per order
 DELTA_BAND = 7000     # penalty band: $0.10 per share over, per second
 
 # Strategy knobs (ours to tune on the practice server).
-MAX_STRADDLES = 500    # per side; 500 straddles = net 1000 contracts = the net limit
-ENTRY_EDGE = 10.0      # $ per straddle, net of costs, required to enter
+# Position structure: ATM straddles carry the vol bet; a smaller strangle at
+# the farthest strikes the OTHER way nets it back under the net limit while
+# filling gross. 850x2 + 350x2 = 2400 gross (limit 2500); 1700 - 700 = 1000
+# net (limit 1000). Far wings have much less vega than ATM, so net vega is
+# ~1.4-1.7x what 500 plain straddles gave under the same net cap.
+ATM_STRADDLES = 850    # straddles at the ATM strike, in the edge direction
+WING_CONTRACTS = 350   # contracts per far wing (lowest put + highest call), opposite way
+ENTRY_EDGE = 15.0      # $ per straddle, net of costs, required to enter
+                       # $10 was noise-chasing (heat 1), but $40 exceeds what
+                       # late-heat vega (~$6-8 per vol pt at tick 150+) can even
+                       # produce, and would skip real week-3/4 shocks (heat 3)
 COST_RESERVE = 10.0    # entry + exit commissions (4 x $2) + $2 hedge/safety cushion
-CONVERGED_IV = 0.01    # exit once MM IV is within 1 vol point of our forecast
-HEDGE_TRIGGER = 5000   # hedge back toward 0 when |delta| exceeds this (band is 7000)
-WEEK4_TICK = 225       # from here hold through expiry; no convergence exit
+CONVERGED_IV = 0.01    # exit when the position's REMAINING directional edge < 1 vol pt
+HEDGE_TRIGGER = 2000   # hedge back toward 0 when |delta| exceeds this (band is 7000)
+                       # was 5000: near expiry an ATM book's delta flips tens of
+                       # thousands as spot crosses the strike, so hedge early and fully
 POLL_SECONDS = 0.25
 
 OPTION = re.compile(r"RTM(\d+(?:\.\d+)?)([CP])$")
@@ -65,13 +75,30 @@ def portfolio_delta(spot, years, rate, sigma, options, rtm_position):
     return delta
 
 
-def straddle_capacity(side_sign, options):
-    """Straddles we may still add on this side under the gross/net limits."""
-    gross = sum(abs(option["position"]) for option in options)
-    net = sum(option["position"] for option in options)
-    gross_room = (GROSS_LIMIT - gross) // 2
-    net_room = (NET_LIMIT - net) // 2 if side_sign > 0 else (NET_LIMIT + net) // 2
-    return int(max(0, min(MAX_STRADDLES, gross_room, net_room)))
+def weave(legs, rtm_quantity=0):
+    """Chunk a multi-leg trade round-robin so delta stays near zero mid-way.
+
+    legs are (symbol, signed quantity to trade). Options go out 100 contracts
+    per order, RTM in proportional slices up to 10k per round. Heat 3 showed
+    why: closing all calls, then all puts, then the RTM serially left the book
+    ~35k shares unbalanced for 2-3 ticks and collected ~$7k of band fines.
+    """
+    legs = [[symbol, quantity] for symbol, quantity in legs if quantity]
+    rounds = max(((abs(q) + MAX_OPT_ORDER - 1) // MAX_OPT_ORDER for _, q in legs), default=0)
+    trades, rtm_left = [], rtm_quantity
+    for i in range(rounds):
+        for leg in legs:
+            chunk = max(-MAX_OPT_ORDER, min(MAX_OPT_ORDER, leg[1]))
+            if chunk:
+                trades.append((leg[0], chunk))
+                leg[1] -= chunk
+        share = max(-MAX_RTM_ORDER, min(MAX_RTM_ORDER, round(rtm_left / (rounds - i))))
+        if share:
+            trades.append(("RTM", share))
+            rtm_left -= share
+    if rtm_left:
+        trades.append(("RTM", rtm_left))
+    return trades
 
 
 def submit(client, ticker, quantity, dry_run, lines):
@@ -101,10 +128,14 @@ def process_tick(client, dry_run, decisions_path, market_path):
     Decision priority, first match wins:
       1. case inactive/expired ........ wait
       2. no exact vol parsed yet ...... wait (never trade on a guess)
-      3. |delta| >= 5,000 ............. hedge RTM back toward zero
-      4. holding + MM IV converged .... close all options (pre-week-4 only)
-      5. holding otherwise ............ hold (week 4 holds through expiry)
-      6. flat + straddle edge > $10 ... enter ATM straddles up to net limit
+      3. holding + remaining directional edge < 1 vol pt
+         ............................. close options AND RTM hedge, interleaved
+         (exit MUST outrank the hedge: a big book breaches the hedge trigger
+         every tick and would starve the exit forever)
+      4. |delta| >= 2,000 ............. hedge full delta back toward zero
+      5. holding otherwise ............ hold, showing the remaining edge
+      6. flat + straddle edge > $15 ... enter 850 ATM straddles + 350/wing
+         ............................. opposite strangle (gross 2400, net 1000)
       7. otherwise .................... wait, printing the insufficient edge
     """
     case = client.get("case")
@@ -169,36 +200,52 @@ def process_tick(client, dry_run, decisions_path, market_path):
         lines.append(f"  position: opts gross {gross}/{GROSS_LIMIT} net {net:+d}/±{NET_LIMIT}"
                      f" | RTM {rtm_position:+d} | delta {delta:+.0f} (hedge at ±{HEDGE_TRIGGER}, band ±{DELTA_BAND})")
 
-        if abs(delta) >= HEDGE_TRIGGER:
-            hedge = max(-MAX_RTM_ORDER, min(MAX_RTM_ORDER, -round(delta)))
-            hedge = max(-RTM_LIMIT - rtm_position, min(RTM_LIMIT - rtm_position, hedge))
+        # NOTE: the exit check must come BEFORE the hedge check. A big book at
+        # high realized vol breaches the hedge trigger every tick, and in that
+        # state a hedge-first ordering starves the exit forever (this held a
+        # dead position from tick ~150 to 240 and gave back ~$40k). Exiting is
+        # safe without a pre-hedge: weave() unwinds options and RTM together.
+        if gross and market_iv is not None and \
+                ((sigma - market_iv) if net >= 0 else (market_iv - sigma)) < CONVERGED_IV:
+            # Remaining edge is DIRECTIONAL: long straddles profit while MM IV
+            # is still below forecast, short while above. This also exits when
+            # the MM overshoots past us (heat 1: long at 16.6%, MM overshot to
+            # 24.7% while realized was 18.6% -- the old week-4 "hold for gamma"
+            # rule bled ~$20k there). Holding for gamma is just the same test:
+            # keep longs only while implied < forecast.
+            decision = (f"exit: remaining edge {(sigma - market_iv if net >= 0 else market_iv - sigma) * 100:+.1f} "
+                        f"vol pts < {CONVERGED_IV:.0%} (MM IV {market_iv:.1%} vs forecast {sigma:.1%})")
+            # Close every option leg AND the RTM hedge, woven together so the
+            # book is never one-legged mid-unwind (heat 1 and 3 fine source).
+            trades = weave([(o["symbol"], -o["position"]) for o in options if o["position"]],
+                           -rtm_position)
+        elif abs(delta) >= HEDGE_TRIGGER:
+            # Hedge the FULL delta (submit() splits it into 10k-share orders);
+            # capping at one order per tick let big strike-crossing delta flips
+            # sit outside the ±7000 band collecting $0.10/share/sec fines.
+            hedge = max(-RTM_LIMIT - rtm_position, min(RTM_LIMIT - rtm_position, -round(delta)))
             decision = f"hedge: |delta| {abs(delta):.0f} >= {HEDGE_TRIGGER}, trade RTM back toward 0"
             trades = [("RTM", hedge)]
-        elif gross and tick < WEEK4_TICK and market_iv is not None and abs(market_iv - sigma) < CONVERGED_IV:
-            decision = (f"exit: MM IV {market_iv:.1%} converged to forecast {sigma:.1%}"
-                        f" (within {CONVERGED_IV:.0%}), close all options")
-            trades = [(o["symbol"], -o["position"]) for o in options if o["position"]]
         elif gross:
-            hold_why = "week 4: holding through expiry for gamma" if tick >= WEEK4_TICK \
-                else f"MM IV {market_iv:.1%} still {abs(market_iv - sigma):.1%} from forecast" if market_iv \
-                else "MM IV unavailable"
-            decision = f"hold: {hold_why}"
+            decision = ("hold: remaining edge "
+                        f"{(sigma - market_iv if net >= 0 else market_iv - sigma) * 100:+.1f} vol pts"
+                        f" (MM IV {market_iv:.1%} vs forecast {sigma:.1%})"
+                        if market_iv else "hold: MM IV unavailable")
         elif max(buy_edge, sell_edge) > ENTRY_EDGE:
             sign = 1 if buy_edge >= sell_edge else -1
-            size = straddle_capacity(sign, options)
-            if size:
-                side = "BUY" if sign > 0 else "SELL"
-                decision = (f"enter: {side} {size} straddles @ K={strike:g},"
-                            f" edge ${max(buy_edge, sell_edge):.0f}/straddle > ${ENTRY_EDGE:.0f} threshold")
-                # Interleave call/put chunks so an error mid-entry never
-                # leaves a large naked single leg.
-                remaining = size
-                while remaining:
-                    chunk = min(remaining, MAX_OPT_ORDER)
-                    trades += [(call["symbol"], sign * chunk), (put["symbol"], sign * chunk)]
-                    remaining -= chunk
-            else:
-                decision = "wait: edge present but no capacity under gross/net limits"
+            side = "BUY" if sign > 0 else "SELL"
+            # ATM straddles in the edge direction plus opposite far wings:
+            # entry happens only from flat, so the constants are the limits.
+            low_put = min((o for o in options if o["kind"] == "P"), key=lambda o: o["strike"])
+            high_call = max((o for o in options if o["kind"] == "C"), key=lambda o: o["strike"])
+            decision = (f"enter: {side} {ATM_STRADDLES} straddles @ K={strike:g}"
+                        f" + {'SELL' if sign > 0 else 'BUY'} {WING_CONTRACTS} wings"
+                        f" @ {low_put['symbol']}/{high_call['symbol']},"
+                        f" edge ${max(buy_edge, sell_edge):.0f}/straddle > ${ENTRY_EDGE:.0f} threshold")
+            trades = weave([(call["symbol"], sign * ATM_STRADDLES),
+                            (put["symbol"], sign * ATM_STRADDLES),
+                            (low_put["symbol"], -sign * WING_CONTRACTS),
+                            (high_call["symbol"], -sign * WING_CONTRACTS)])
         else:
             decision = f"wait: best edge ${max(buy_edge, sell_edge):.0f}/straddle below ${ENTRY_EDGE:.0f} threshold"
 

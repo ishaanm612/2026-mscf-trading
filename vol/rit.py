@@ -6,6 +6,7 @@ helpers this bot actually uses. One deliberate difference: a 429 (rate-limited)
 response is retried for POSTs too, because 429 means the exchange rejected the
 request before processing it, so a retry cannot double-trade.
 """
+import base64
 import json
 import os
 import time
@@ -16,8 +17,15 @@ from urllib.request import Request, urlopen
 
 class Client:
     def __init__(self, url=None, api_key=None):
+        """RIT_USERNAME/RIT_PASSWORD selects DMA basic auth (remote server);
+        otherwise RIT_API_KEY is used against a local RIT client."""
         self.url = (url or os.environ.get("RIT_API_URL", "http://localhost:9999/v1")).rstrip("/")
-        self.headers = {"X-API-Key": api_key or os.environ.get("RIT_API_KEY", "Rotman")}
+        username = os.environ.get("RIT_USERNAME")
+        if username:
+            credentials = f"{username}:{os.environ.get('RIT_PASSWORD', '')}"
+            self.headers = {"Authorization": "Basic " + base64.b64encode(credentials.encode()).decode()}
+        else:
+            self.headers = {"X-API-Key": api_key or os.environ.get("RIT_API_KEY", "Rotman")}
 
     def get(self, endpoint, **params):
         return self.request("GET", endpoint, **params)

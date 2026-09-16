@@ -6,7 +6,7 @@ import math
 import unittest
 
 import pricing
-from bot import straddle_capacity
+from bot import ATM_STRADDLES, GROSS_LIMIT, NET_LIMIT, WING_CONTRACTS, weave
 from news import forecast_sigma, parse_news
 
 
@@ -79,25 +79,33 @@ class TestNews(unittest.TestCase):
 
 
 class TestSizing(unittest.TestCase):
-    def _options(self, positions):
-        return [{"position": p} for p in positions]
+    def test_structure_fits_exchange_limits(self):
+        self.assertLessEqual(2 * ATM_STRADDLES + 2 * WING_CONTRACTS, GROSS_LIMIT)
+        self.assertLessEqual(abs(2 * ATM_STRADDLES - 2 * WING_CONTRACTS), NET_LIMIT)
 
-    def test_full_size_when_flat(self):
-        self.assertEqual(straddle_capacity(1, self._options([0, 0])), 500)
-        self.assertEqual(straddle_capacity(-1, self._options([0, 0])), 500)
+    def test_weave_totals_and_chunk_sizes(self):
+        trades = weave([("C", 850), ("P", 850), ("LP", -350), ("HC", -350)])
+        sums = {}
+        for symbol, quantity in trades:
+            self.assertLessEqual(abs(quantity), 100)
+            sums[symbol] = sums.get(symbol, 0) + quantity
+        self.assertEqual(sums, {"C": 850, "P": 850, "LP": -350, "HC": -350})
 
-    def test_net_limit_binds(self):
-        # Long 400 calls + 400 puts: net +800, room for 100 more buy-side straddles.
-        self.assertEqual(straddle_capacity(1, self._options([400, 400])), 100)
-        # Selling against a long book is capped by MAX_STRADDLES, not the limits.
-        self.assertEqual(straddle_capacity(-1, self._options([400, 400])), 500)
+    def test_weave_interleaves_legs(self):
+        trades = weave([("C", 300), ("P", 300)])
+        # No leg gets a second chunk before every live leg has its first.
+        self.assertEqual([t[0] for t in trades[:2]], ["C", "P"])
+        self.assertEqual([t[0] for t in trades], ["C", "P"] * 3)
 
-    def test_gross_limit_binds(self):
-        # 1200 long + 1200 short contracts: gross 2400, only 50 straddles left.
-        self.assertEqual(straddle_capacity(1, self._options([1200, -1200])), 50)
+    def test_weave_slices_rtm_across_rounds(self):
+        trades = weave([("C", -500), ("P", -500)], 26049)
+        rtm = [quantity for symbol, quantity in trades if symbol == "RTM"]
+        self.assertEqual(sum(rtm), 26049)
+        self.assertTrue(all(abs(q) <= 10000 for q in rtm))
+        self.assertGreaterEqual(len(rtm), 3)  # spread out, not one naked lump
 
-    def test_never_negative(self):
-        self.assertEqual(straddle_capacity(1, self._options([600, 600])), 0)
+    def test_weave_rtm_only(self):
+        self.assertEqual(weave([], 12000), [("RTM", 12000)])
 
 
 if __name__ == "__main__":

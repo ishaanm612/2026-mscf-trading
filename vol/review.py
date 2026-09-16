@@ -135,7 +135,7 @@ def main(path):
     final = rows[-1]["securities"]
     for s in final:
         if s.get("position") or s.get("realized"):
-            print(f"  {s['ticker']:>8}: position {s.get('position', 0):+d}"
+            print(f"  {s['ticker']:>8}: position {s.get('position', 0):+,.0f}"
                   f" realized {s.get('realized', 0):+,.0f} unrealized {s.get('unrealized', 0):+,.0f}")
 
 
