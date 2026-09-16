@@ -47,6 +47,19 @@ class Models(unittest.TestCase):
         self.assertLess(report["estimated_unwind_profit_usd"], 0)
         self.assertEqual(report["decision"], "REVIEW")
 
+    def test_basket_report_uses_executable_fx_and_fee_funding(self):
+        snapshot = demo("etf")
+        # Tighten USD to make the expected CAD conversion and round-up explicit.
+        snapshot["books"]["USD"] = {"bids": [{"price": 1.00, "quantity": 1000000}],
+                                    "asks": [{"price": 1.01, "quantity": 1000000}]}
+        report = etf.basket_opportunity(snapshot, 1, 1000, 300000, 200000)
+        self.assertEqual(report["fx_leg"], {"ticker": "USD", "quantity": 24830, "action": "BUY"})
+        self.assertAlmostEqual(report["basket_cad_per_unit"], 24.98)
+        self.assertAlmostEqual(report["ritc_cad_per_unit"], 24.81 * 1.01)
+        self.assertAlmostEqual(report["fees_cad_per_unit"], .04 + .02 * 1.01)
+        self.assertFalse(report["eligible_after_buffer"])
+        self.assertTrue(report["within_configured_limits"])
+
 
 if __name__ == "__main__":
     unittest.main()

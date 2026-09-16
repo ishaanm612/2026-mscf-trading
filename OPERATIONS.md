@@ -4,8 +4,10 @@
 
 Run commands from the repository root, with Python 3.10+. There are no pip dependencies. Credentials are environment variables, never source files. Do not run the original scripts in `reference/` alongside this bot.
 
-For DMA, place `RIT_API_MODE=dma`, `RIT_USERNAME`, `RIT_PASSWORD`, and the
-appropriate `RIT_API_URL` in the ignored repository `.env` file. Copy
+For DMA, place separate `RIT_ETF_API_MODE`, `RIT_ETF_API_URL`,
+`RIT_ETF_USERNAME`, `RIT_ETF_PASSWORD` and `RIT_VOLATILITY_*` values in the
+ignored repository `.env` file. The runner selects the matching case values.
+Legacy generic `RIT_*` variables remain a fallback. Copy
 `.env.example` first if needed. Shell variables take precedence over `.env`.
 Use a separate terminal per case. The confirmed practice API URLs are:
 
@@ -59,6 +61,15 @@ python3 scripts/supervise_volatility.py --trade \
   --record data/volatility-snapshots.jsonl
 ```
 
+The same supervisor can manage ETF lifecycle restarts. ETF limits must come
+from the active session; `--basket` is still explicit because tender handling
+and inventory reduction are the safer default.
+
+```sh
+python3 scripts/supervise_volatility.py --case etf \
+  --gross-limit 300000 --net-limit 200000 --basket
+```
+
 The supervisor does not restart a worker that exits with an API, execution, or
 risk error. Inspect `--check`, resolve open orders, and run `--reconcile` before
 starting it again. This prevents a market reset from disguising an ambiguous
@@ -89,7 +100,7 @@ Snapshots are not atomic. Volatility click trading can change the account while 
 - First reduce actual USD cash exposure. FX child orders use current account inventory, not predicted cash from a submitted order.
 - Unwind existing equity inventory one child at a time, selecting a risk-legal order with enough visible depth. On restart, existing baskets are treated as inventory to close.
 - Accept only fixed-price RITC tenders with sufficient visible unwind depth, at least three ticks remaining, enough projected risk capacity, and a 0.05 USD/unit cushion beyond modeled unwind fees.
-- Optional baskets enter only while equity inventory is flat and estimated CAD edge exceeds 0.10/unit after modeled fees. Each leg must fully fill; inventory is reread before the next. Hold until the entry-direction edge disappears, then unwind. No automated converters are used.
+- Optional baskets enter only while equity inventory is flat and the executable CAD edge clears a 0.10/unit serial-execution reserve. The signal crosses BULL/BEAR/RITC/USD visible depth, includes all three equity fees, and rounds the indicative USD funding amount up to cover RITC plus its fee. Each leg must fully fill; inventory is reread before the next and the actual USD position is hedged after the RITC fill. Hold until the entry-direction edge disappears, then unwind. No automated converters are used.
 - From tick 250, take no new tenders/baskets. Gross risk counts RITC twice. Server `limits[].units` expresses instrument units per risk unit: a binding of 0.5 means a reciprocal weight of 2.
 - A basket is a statistical convergence trade with sequential execution. Partial legs create directional exposure, and any failure stops the runner for reconciliation. Tender estimates are static depth calculations, not promises about the eventual unwind.
 

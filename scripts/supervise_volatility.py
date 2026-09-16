@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch exactly one volatility worker for each active RIT practice heat.
+"""Launch exactly one selected-case worker for each active RIT practice heat.
 
 The supervisor only responds to confirmed case lifecycle changes.  It never
 retries an order, removes an execution lock, or restarts a worker that exits
@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from client import Client
-from environment import load_env_file
+from environment import configure_case_environment, load_env_file
 from volatility.supervisor import SessionMarker
 
 
@@ -31,20 +31,24 @@ def worker_command(args: argparse.Namespace) -> list[str]:
     :returns: Arguments for a worker process running from the repository root.
     """
 
-    command = [sys.executable, "run.py", "volatility", "--source", "api", "--watch", "--exit-on-session-change"]
+    command = [sys.executable, "run.py", args.case, "--source", "api", "--watch", "--exit-on-session-change"]
     command.append("--trade" if args.trade else "--plan")
-    if args.rate is not None:
+    if args.case == "volatility" and args.rate is not None:
         command.extend(["--rate", str(args.rate)])
     if args.flatten_only:
         command.append("--flatten-only")
     if args.journal:
         command.extend(["--journal", args.journal])
-    if args.decision_log:
+    if args.case == "volatility" and args.decision_log:
         command.extend(["--decision-log", args.decision_log])
     if args.record:
         command.extend(["--record", args.record])
-    if args.no_explainability:
+    if args.case == "volatility" and args.no_explainability:
         command.append("--no-explainability")
+    if args.case == "etf":
+        command.extend(["--gross-limit", str(args.gross_limit), "--net-limit", str(args.net_limit)])
+        if args.basket:
+            command.append("--basket")
     return command
 
 
@@ -87,7 +91,7 @@ def supervise(args: argparse.Namespace) -> None:
     command = worker_command(args)
     while True:
         marker = wait_for_active_case(client, args.poll_seconds)
-        print(f"supervisor: starting volatility worker for period={marker.period} tick={marker.tick}", flush=True)
+        print(f"supervisor: starting {args.case} worker for period={marker.period} tick={marker.tick}", flush=True)
         worker = subprocess.Popen(command, cwd=ROOT)
         try:
             exit_code = worker.wait()
@@ -96,7 +100,7 @@ def supervise(args: argparse.Namespace) -> None:
             worker.wait()
             raise
         if exit_code != 0:
-            raise RuntimeError(f"volatility worker exited with status {exit_code}; inspect and reconcile before restarting")
+            raise RuntimeError(f"{args.case} worker exited with status {exit_code}; inspect and reconcile before restarting")
         print("supervisor: worker observed a market stop/reset; waiting for the next active heat", flush=True)
 
 
@@ -107,7 +111,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     :returns: Validated command-line settings.
     """
 
-    parser = argparse.ArgumentParser(description="Restart a volatility worker only after an RIT market reset.")
+    parser = argparse.ArgumentParser(description="Restart a selected-case worker only after an RIT market reset.")
+    parser.add_argument("--case", choices=("volatility", "etf"), default="volatility",
+                        help="Practice case to supervise (default: volatility)")
     parser.add_argument("--trade", action="store_true", help="Allow the child worker to submit simulated practice orders")
     parser.add_argument("--flatten-only", action="store_true", help="Reduce confirmed inventory; do not open new exposure")
     parser.add_argument("--rate", type=float, help="Annualized risk-free rate supplied to the model")
@@ -115,19 +121,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--decision-log", help="Append structured decision records across heats")
     parser.add_argument("--record", help="Append raw API snapshots across heats")
     parser.add_argument("--no-explainability", action="store_true", help="Omit factor-level decision rationale")
+    parser.add_argument("--gross-limit", type=int, help="Required ETF session gross limit")
+    parser.add_argument("--net-limit", type=int, help="Required ETF session net limit")
+    parser.add_argument("--basket", action="store_true", help="Enable serial ETF basket entries; ETF tenders remain enabled")
     parser.add_argument("--poll-seconds", type=float, default=1.0, help="Read-only case poll interval while waiting (default: 1)")
     args = parser.parse_args(argv)
     if args.poll_seconds <= 0:
         parser.error("--poll-seconds must be positive")
+    if args.case == "etf" and (args.gross_limit is None or args.net_limit is None):
+        parser.error("--case etf requires --gross-limit and --net-limit from the session")
+    if args.case == "volatility" and (args.gross_limit is not None or args.net_limit is not None or args.basket):
+        parser.error("ETF limits and --basket require --case etf")
     return args
 
 
 def main() -> None:
-    """Run the volatility lifecycle supervisor and preserve safe failure behavior."""
+    """Run the selected-case lifecycle supervisor and preserve safe failure behavior."""
 
     try:
         load_env_file(ROOT / ".env")
-        supervise(parse_args())
+        args = parse_args()
+        configure_case_environment(args.case)
+        supervise(args)
     except KeyboardInterrupt:
         print("supervisor: stopped", flush=True)
     except RuntimeError as error:

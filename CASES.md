@@ -6,7 +6,7 @@ Reviewed September 13, 2026. [Event and setup page](https://www.rotman.utoronto.
 
 [Official specification](https://rotmanfrtl.github.io/RITCx-Algorithmic%20ETF%20Arb%20Case.pdf): 300 seconds; BULL and BEAR are CAD-denominated, RITC is USD-denominated. Equilibrium is `RITC × USD/CAD = BULL + BEAR`. RITC carries 2× position weight. Equity orders are capped at 10,000; market fees are 0.02/share. Converters are manual only. Numeric gross/net limits are not supplied in the specification; obtain them from the session. The template's limits are illustrative.
 
-Our foundation evaluates both basket directions and tender liquidation against visible depth. ETF fee conversion assumes fees in quote currency; verify this in practice. The execution layer hedges actual USD inventory after fills. The bot checks expiry, existing inventory, open orders, current depth, and risk before accepting a fixed-price tender. Statistical convergence is not guaranteed immediate arbitrage.
+Our foundation evaluates both basket directions and tender liquidation against visible depth. Basket reports cross BULL, BEAR, RITC, and USD depth; they report the rounded-up USD funding estimate and price the RITC fee in USD before conversion to CAD. Verify this fee treatment in practice. The execution layer hedges actual USD inventory after fills rather than trusting that estimate. The bot checks expiry, existing inventory, open orders, current depth, and risk before accepting a fixed-price tender. Statistical convergence is not guaranteed immediate arbitrage.
 
 ## Volatility Trading
 

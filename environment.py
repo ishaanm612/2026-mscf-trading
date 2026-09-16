@@ -73,3 +73,32 @@ def load_env_file(path: str | Path, *, override: bool = False) -> tuple[str, ...
             os.environ[key] = _parse_value(raw_value, line_number)
             loaded.append(key)
     return tuple(loaded)
+
+
+def configure_case_environment(case: str) -> tuple[str, ...]:
+    """Select optional case-specific RIT credentials for this process.
+
+    ``RIT_ETF_*`` and ``RIT_VOLATILITY_*`` values take precedence over the
+    legacy generic ``RIT_*`` variables once a runner has selected its case.
+    This lets one ignored ``.env`` hold separate practice credentials without
+    writing either set back to disk.  Generic variables remain a compatible
+    fallback for REST and existing one-case configurations.
+
+    :param case: ``etf`` or ``volatility``.
+    :returns: Generic variable names populated from case-specific settings;
+        values are intentionally never returned.
+    :raises ValueError: If the case is unsupported.
+    """
+
+    prefixes = {"etf": "RIT_ETF", "volatility": "RIT_VOLATILITY"}
+    try:
+        prefix = prefixes[case]
+    except KeyError as error:
+        raise ValueError(f"Unsupported RIT case: {case}") from error
+    selected: list[str] = []
+    for suffix in ("API_MODE", "API_URL", "USERNAME", "PASSWORD", "API_KEY"):
+        value = os.environ.get(f"{prefix}_{suffix}")
+        if value is not None:
+            os.environ[f"RIT_{suffix}"] = value
+            selected.append(f"RIT_{suffix}")
+    return tuple(selected)

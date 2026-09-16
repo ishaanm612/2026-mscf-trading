@@ -6,7 +6,7 @@ from typing import Any
 from models import etf, volatility
 from client import Client, RITReadError
 from bot import Bot
-from environment import load_env_file
+from environment import configure_case_environment, load_env_file
 from execution import Executor
 from volatility.logger import StrategyLogger
 from volatility.reporting import format_volatility_report, summarize_volatility_result
@@ -84,6 +84,7 @@ def main() -> None:
     parser.add_argument("--convergence-model", help="Validated JSON convergence model used as an opt-in entry filter")
     parser.add_argument("--verbose", action="store_true", help="Print raw strategy payloads instead of compact operational reports")
     args = parser.parse_args()
+    configure_case_environment(args.case)
     if args.case == "volatility" and args.sigma is None and not (args.plan or args.trade or args.check or args.reconcile):
         parser.error("volatility requires --sigma (use current analyst information)")
     if args.trade and args.plan:

@@ -1,8 +1,11 @@
 """Depth-aware ETF signals; proposed legs are not atomic or guaranteed profits."""
 from __future__ import annotations
 
+import math
 from typing import Any, Iterable, Mapping
 WEIGHTS = {"BULL": 1, "BEAR": 1, "RITC": 2}
+EQUITY_FEE = 0.02
+DEFAULT_ENTRY_BUFFER_CAD = 0.10
 
 
 def exposure(positions: Mapping[str, float]) -> dict[str, float]:
@@ -53,6 +56,69 @@ def vwap(book: Mapping[str, Any], action: str, quantity: int) -> float:
     raise ValueError("insufficient visible depth")
 
 
+def basket_opportunity(snapshot: Mapping[str, Any], direction: int, quantity: int,
+                       gross_limit: float | None = None, net_limit: float | None = None,
+                       entry_buffer_cad: float = DEFAULT_ENTRY_BUFFER_CAD) -> dict[str, Any]:
+    """Price one fully hedged ETF basket using executable depth.
+
+    ``direction=1`` sells the CAD BULL/BEAR basket and buys USD RITC; the
+    inverse direction buys the basket and sells RITC.  USD is traded in the
+    same direction as RITC to neutralize the currency created or consumed by
+    that leg.  Currency quantity is rounded *up* to fund RITC plus its stated
+    per-share fee, so a plan never understates the required USD hedge.
+
+    The reported edge includes the three equity commissions and all observed
+    bid/ask crossing through the VWAPs.  ``entry_buffer_cad`` is an additional
+    reserve for the non-atomic, serial execution sequence; it is not a claim
+    that the later unwind is free or guaranteed.
+
+    :param snapshot: Fresh ETF snapshot containing BULL, BEAR, RITC and USD books.
+    :param direction: ``1`` for long RITC/short basket; ``-1`` for the inverse.
+    :param quantity: Positive RITC and matching basket share quantity.
+    :returns: Explainable executable-price and eligibility report.
+    :raises ValueError: If inputs are invalid or any required visible depth is absent.
+    """
+
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    if not 0 < quantity <= 10000:
+        raise ValueError("ETF child quantity must be 1..10000")
+    if entry_buffer_cad < 0:
+        raise ValueError("entry buffer cannot be negative")
+    books = snapshot["books"]
+    positions = {s["ticker"]: s["position"] for s in snapshot["securities"]}
+    stock_action = "SELL" if direction == 1 else "BUY"
+    etf_action = "BUY" if direction == 1 else "SELL"
+    basket_prices = {ticker: vwap(books[ticker], stock_action, quantity) for ticker in ("BULL", "BEAR")}
+    etf_price = vwap(books["RITC"], etf_action, quantity)
+    # The price and commission are USD/share; USD trades in whole currency units.
+    required_usd = quantity * (etf_price + EQUITY_FEE)
+    # Do not turn an exact decimal-cent amount into an extra USD unit merely
+    # because binary floats represent it as e.g. 24830.000000000004.
+    usd_quantity = math.ceil(required_usd - 1e-9)
+    fx_price = vwap(books["USD"], etf_action, usd_quantity)
+    basket_cad = sum(basket_prices.values())
+    etf_cad = etf_price * fx_price
+    fees_cad = 2 * EQUITY_FEE + EQUITY_FEE * fx_price
+    edge = direction * (basket_cad - etf_cad) - fees_cad
+    legs = [("BULL", -direction * quantity), ("BEAR", -direction * quantity), ("RITC", direction * quantity)]
+    allowed = None if gross_limit is None or net_limit is None else within_limits(positions, legs, gross_limit, net_limit)
+    return {
+        "direction": "LONG_RITC_SHORT_BASKET" if direction == 1 else "SHORT_RITC_LONG_BASKET",
+        "legs": legs,
+        "fx_leg": {"ticker": "USD", "quantity": direction * usd_quantity, "action": etf_action},
+        "executable_prices": {"BULL": basket_prices["BULL"], "BEAR": basket_prices["BEAR"],
+                              "RITC_usd": etf_price, "USD_cad_per_usd": fx_price},
+        "basket_cad_per_unit": basket_cad,
+        "ritc_cad_per_unit": etf_cad,
+        "fees_cad_per_unit": fees_cad,
+        "edge_cad_per_unit": edge,
+        "entry_buffer_cad_per_unit": entry_buffer_cad,
+        "eligible_after_buffer": edge >= entry_buffer_cad,
+        "within_configured_limits": allowed,
+    }
+
+
 def analyze(snapshot: Mapping[str, Any], quantity: int = 1000, gross_limit: float | None = None,
             net_limit: float | None = None) -> dict[str, Any]:
     """Evaluate ETF basket and tender opportunities without trading.
@@ -65,25 +131,13 @@ def analyze(snapshot: Mapping[str, Any], quantity: int = 1000, gross_limit: floa
     """
     if not 0 < quantity <= 10000:
         raise ValueError("ETF child quantity must be 1..10000")
-    books = snapshot["books"]
     positions = {s["ticker"]: s["position"] for s in snapshot["securities"]}
     results = []
     for direction in (1, -1):
-        legs = [("BULL", -direction * quantity), ("BEAR", -direction * quantity),
-                ("RITC", direction * quantity)]
         try:
-            stock_side = "SELL" if direction == 1 else "BUY"
-            etf_side = "BUY" if direction == 1 else "SELL"
-            basket = sum(vwap(books[t], stock_side, quantity) for t in ("BULL", "BEAR"))
-            etf = vwap(books["RITC"], etf_side, quantity)
-            fx = vwap(books["USD"], etf_side, quantity * (etf + 0.02))
-            edge = direction * (basket - etf * fx) - 0.04 - 0.02 * fx
-            allowed = None if gross_limit is None or net_limit is None else within_limits(
-                positions, legs, gross_limit, net_limit)
-            results.append({"legs": legs, "edge_cad_per_unit": edge,
-                            "within_configured_limits": allowed})
+            results.append(basket_opportunity(snapshot, direction, quantity, gross_limit, net_limit))
         except ValueError as error:
-            results.append({"legs": legs, "skip": str(error)})
+            results.append({"direction": direction, "skip": str(error)})
     tenders = []
     for offer in snapshot.get("tenders", []):
         report = {"tender_id": offer["tender_id"], "decision": "REVIEW"}
@@ -94,8 +148,8 @@ def analyze(snapshot: Mapping[str, Any], quantity: int = 1000, gross_limit: floa
             if action not in ("BUY", "SELL"):
                 raise ValueError("unknown tender action")
             unwind = "SELL" if action == "BUY" else "BUY"
-            market = vwap(books["RITC"], unwind, q)
-            edge = (market - offer["price"]) * (1 if action == "BUY" else -1) - 0.02
+            market = vwap(snapshot["books"]["RITC"], unwind, q)
+            edge = (market - offer["price"]) * (1 if action == "BUY" else -1) - EQUITY_FEE
             report["estimated_unwind_profit_usd"] = edge * q
             report["note"] = "Static depth estimate; unwind needs child orders and fresh quotes."
         except (ValueError, KeyError) as error:

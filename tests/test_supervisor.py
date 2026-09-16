@@ -39,6 +39,16 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("--exit-on-session-change", trade)
         self.assertIn("data/decisions.jsonl", trade)
 
+    def test_etf_worker_command_selects_case_and_required_risk_limits(self) -> None:
+        """Build an ETF plan worker without accidentally enabling baskets."""
+
+        command = worker_command(parse_args(["--case", "etf", "--gross-limit", "300000", "--net-limit", "200000"]))
+        self.assertEqual(command[2], "etf")
+        self.assertIn("--plan", command)
+        self.assertIn("--gross-limit", command)
+        self.assertIn("300000", command)
+        self.assertNotIn("--basket", command)
+
 
 if __name__ == "__main__":
     unittest.main()

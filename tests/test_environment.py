@@ -5,8 +5,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from environment import load_env_file
+from environment import configure_case_environment, load_env_file
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -49,6 +50,25 @@ class EnvironmentTests(unittest.TestCase):
                     os.environ.pop("RIT_TEST_SETTING", None)
                 else:
                     os.environ["RIT_TEST_SETTING"] = previous
+
+    def test_case_credentials_replace_generic_fallback_for_selected_case(self) -> None:
+        """Keep ETF and volatility practice accounts separate in one process."""
+
+        values = {
+            "RIT_USERNAME": "legacy",
+            "RIT_PASSWORD": "legacy-password",
+            "RIT_ETF_USERNAME": "etf-user",
+            "RIT_ETF_PASSWORD": "etf-password",
+            "RIT_ETF_API_URL": "http://etf.example/v1",
+            "RIT_VOLATILITY_USERNAME": "vol-user",
+            "RIT_VOLATILITY_PASSWORD": "vol-password",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            self.assertEqual(configure_case_environment("etf"),
+                             ("RIT_API_URL", "RIT_USERNAME", "RIT_PASSWORD"))
+            self.assertEqual(os.environ["RIT_USERNAME"], "etf-user")
+            configure_case_environment("volatility")
+            self.assertEqual(os.environ["RIT_USERNAME"], "vol-user")
 
 
 if __name__ == "__main__":

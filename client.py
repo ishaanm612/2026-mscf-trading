@@ -86,7 +86,10 @@ class Client:
         state = self.get("case")
         result = {"case": state, "securities": self.get("securities")}
         if case == "etf":
-            result["books"] = {t: self.get("securities/book", ticker=t, limit=100)
+            # ETF DMA accepts the ticker parameter but rejects the optional
+            # REST-style depth limit on the practice server.  The full visible
+            # book is required for VWAP in either transport mode.
+            result["books"] = {t: self.get("securities/book", ticker=t)
                                for t in ("BULL", "BEAR", "RITC", "USD")}
             result["tenders"] = self.get("tenders")
         else:

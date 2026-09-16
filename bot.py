@@ -305,7 +305,11 @@ class Bot:
         reduction after reconciling the interrupted journal.
         """
         for opportunity in analysis["opportunities"]:
-            if opportunity.get("edge_cad_per_unit", -1) < .10 or not opportunity.get("within_configured_limits"):
+            # The model prices all visible depth, commissions, and the USD
+            # conversion.  It still reserves an explicit buffer because legs
+            # fill serially and no converter makes this atomic.
+            if (not opportunity.get("eligible_after_buffer")
+                    or not opportunity.get("within_configured_limits")):
                 continue
             legs = opportunity["legs"]
             if not self.executor:
