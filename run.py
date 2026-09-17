@@ -56,6 +56,41 @@ def demo_prices(case: str) -> dict[str, Any]:
             "tenders": []}
 
 
+def format_etf_tender_alert(assessment: dict[str, Any], submitted_tender_id: int | None = None) -> str:
+    """Render a conspicuous, operator-readable tender decision for the CLI."""
+
+    estimate = assessment.get("estimated_unwind_profit_cad")
+    minimum = assessment.get("minimum_profit_cad")
+    estimate_text = "unavailable" if estimate is None else f"C${estimate:,.2f}"
+    minimum_text = "n/a" if minimum is None else f"C${minimum:,.2f}"
+    quantity = assessment.get("quantity")
+    price = assessment.get("price")
+    quantity_text = f"{quantity:,}" if isinstance(quantity, (int, float)) else repr(quantity)
+    price_text = f"${price:.2f}" if isinstance(price, (int, float)) else repr(price)
+    decision = "ACCEPTED" if assessment.get("tender_id") == submitted_tender_id else assessment["decision"]
+    return (f"\n{'!' * 72}\n"
+            f"!!! ETF TENDER #{assessment['tender_id']} — {decision}\n"
+            f"Offer: {assessment['action']} {quantity_text} RITC @ {price_text} "
+            f"(expires tick {assessment['expires']})\n"
+            f"FX-adjusted unwind estimate: {estimate_text}; required buffer: {minimum_text}\n"
+            f"Liquidation budget: {assessment.get('liquidation_budget')}\n"
+            f"Reason: {assessment['reason']}\n"
+            f"{'!' * 72}")
+
+
+def format_manual_converter_alert(recommendation: dict[str, Any]) -> str:
+    """Render an urgent manual-only ETF converter instruction."""
+
+    return (f"\n{'#' * 72}\n"
+            f"### MANUAL {recommendation['manual_action']} REQUIRED — {recommendation['converter']}\n"
+            f"Use the RIT Client Assets converter for {recommendation['blocks']} available block(s).\n"
+            f"One block converts {recommendation['convert_from']} -> {recommendation['convert_to']}.\n"
+            f"Estimated advantage versus direct liquidation: "
+            f"C${recommendation['estimated_advantage_cad']:,.2f} per block.\n"
+            f"Decision: PAUSE AUTOMATED UNWIND AND PERFORM THE MANUAL CONVERSION.\n"
+            f"{'#' * 72}")
+
+
 def main() -> None:
     """Parse CLI options and run one read-only or explicitly opted-in cycle."""
     load_env_file(".env")
@@ -153,6 +188,22 @@ def main() -> None:
                     elif decision_logger and args.case == "volatility" and isinstance(result, dict):
                         decision_logger.write("execution_wait", {"tick": snapshot["case"]["tick"], **result})
                     displayed = result
+                    if args.case == "etf" and bot and snapshot.get("tenders"):
+                        positions = {item["ticker"]: item["position"] for item in snapshot["securities"]}
+                        analysis = etf.analyze(snapshot, args.quantity, args.gross_limit, args.net_limit)
+                        submitted_tender_id = result.get("tender_id") if isinstance(result, dict) else None
+                        refreshed_assessment = (result.get("tender_assessment")
+                                                if isinstance(result, dict) else None)
+                        for assessment in bot.tender_assessments(snapshot, positions, analysis):
+                            if (isinstance(refreshed_assessment, dict)
+                                    and refreshed_assessment.get("tender_id") == assessment.get("tender_id")):
+                                # Report the same refreshed prices and limits
+                                # that authorized or rejected the submission.
+                                assessment = refreshed_assessment
+                            print(format_etf_tender_alert(assessment, submitted_tender_id), flush=True)
+                    if (args.case == "etf" and isinstance(result, dict)
+                            and isinstance(result.get("manual_converter"), dict)):
+                        print(format_manual_converter_alert(result["manual_converter"]), flush=True)
                     if args.case == "volatility" and bot and not args.verbose and isinstance(result, dict):
                         print(format_volatility_report(summarize_volatility_result(snapshot, result)), flush=True)
                     else:

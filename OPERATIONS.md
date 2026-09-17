@@ -14,7 +14,7 @@ Use a separate terminal per case. The confirmed practice API URLs are:
 | Case | URL |
 | --- | --- |
 | Volatility | `http://flserver.rotman.utoronto.ca:16595/v1` |
-| ETF | `http://flserver.rotman.utoronto.ca:16635/v1` |
+| ETF | `http://flserver.rotman.utoronto.ca:16655/v1` |
 
 Windows RIT server ports 16590/16630 are client login ports, not these DMA API URLs. For client REST, set `RIT_API_MODE=rest`, `RIT_API_KEY`, and the client's local API URL instead.
 
@@ -43,7 +43,7 @@ python3 run.py etf --source api --plan --watch --gross-limit 300000 --net-limit 
 python3 run.py etf --source api --trade --watch --gross-limit 300000 --net-limit 200000
 ```
 
-ETF mode starts with tenders and inventory reduction. Add `--basket` to enable three-leg statistical arbitrage. `--quantity` controls ETF unwind/basket child size (default 1,000; maximum 10,000). Tenders larger than 10,000 units are skipped in this MVP. This intentionally leaves some opportunities unused.
+ETF mode starts with tenders and inventory reduction. Add `--basket` to enable three-leg statistical arbitrage. `--quantity` controls basket-entry child size (default 1,000; maximum 10,000); inventory reduction uses depth-supported children up to the venue's 10,000-share cap. Every visible tender prints a high-visibility CLI alert with its offer terms, executable unwind estimate, decision, and binding reason. When a manual ETF Creation or Redemption is economically preferred, the bot pauses automated unwinding and prints a boxed `MANUAL WIND/UNWIND REQUIRED` instruction.
 
 Without `--watch`, only one decision is made. With `--watch`, the process polls until Ctrl+C, including through stopped sessions. Ctrl+C stops further submissions; it does not flatten holdings or cancel an order that may already have reached the server. A process lock prevents two instances from using the same journal; run only one bot per account and do not bypass this with alternate journal paths.
 
@@ -100,11 +100,12 @@ Snapshots are not atomic. Volatility click trading can change the account while 
 
 ## ETF decisions and units
 
-- First reduce actual USD cash exposure. FX child orders use current account inventory, not predicted cash from a submitted order.
-- Unwind existing equity inventory one child at a time, selecting a risk-legal order with enough visible depth. On restart, existing baskets are treated as inventory to close.
-- Accept only fixed-price RITC tenders with sufficient visible unwind depth, at least three ticks remaining, enough projected risk capacity, and a 0.05 USD/unit cushion beyond modeled unwind fees.
-- Optional baskets enter only while equity inventory is flat and the executable CAD edge clears a 0.10/unit serial-execution reserve. The signal crosses BULL/BEAR/RITC/USD visible depth, includes all three equity fees, and rounds the indicative USD funding amount up to cover RITC plus its fee. Each leg must fully fill; inventory is reread before the next and the actual USD position is hedged after the RITC fill. Hold until the entry-direction edge disappears, then unwind. No automated converters are used.
-- From tick 250, take no new tenders/baskets. Gross risk counts RITC twice. Server `limits[].units` expresses instrument units per risk unit: a binding of 0.5 means a reciprocal weight of 2.
+- Keep RITC and its naturally offsetting USD cash together while equity inventory is worked. Convert only the final net USD balance after the equity position is flat; this avoids paying an unnecessary gross FX round trip.
+- Before direct liquidation, compare eligible 10,000-unit manual converter blocks with executable direct-unwind prices. ETF Redemption consumes 10,000 RITC and produces 10,000 BULL plus 10,000 BEAR; ETF Creation does the inverse. Each use costs USD 1,500. The API cannot invoke converters, so a preferred route pauses the bot and loudly directs the operator to use the RIT Client Assets tab.
+- Otherwise unwind existing equity inventory one child at a time, selecting a risk-legal order with enough visible depth. On restart, existing baskets are treated as inventory to close.
+- Accept only fixed-price RITC tenders with sufficient visible full-size unwind depth, projected risk capacity, a C$0.0025/share cushion after converting the final net USD result, and enough time before the 300-tick case end for legal child orders plus the final FX conversion. Tender expiry is only the acceptance deadline: a still-visible offer is eligible until that deadline, and a fresh full snapshot must still contain and approve it immediately before submission.
+- Optional baskets enter only while equity inventory is flat and the executable CAD edge clears a 0.10/unit serial-execution reserve. The signal crosses BULL/BEAR/RITC/USD visible depth and includes all three equity fees. Indicative USD is rounded up for a purchase after its fee and down for sale proceeds after its fee. Each leg must fully fill; inventory is reread before the next. Hold until the entry-direction edge disappears, unwind equities, then convert final net USD. Converters remain human-operated.
+- From tick 250, take no new baskets. A tender can still qualify after tick 250 only when its size-aware liquidation budget fits before case end. Gross risk counts RITC twice. Server `limits[].units` expresses instrument units per risk unit: a binding of 0.5 means a reciprocal weight of 2.
 - A basket is a statistical convergence trade with sequential execution. Partial legs create directional exposure, and any failure stops the runner for reconciliation. Tender estimates are static depth calculations, not promises about the eventual unwind.
 
 ## Failure and recovery

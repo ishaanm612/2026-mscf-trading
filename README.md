@@ -127,7 +127,7 @@ inspect account state and reconcile its journal before manually restarting.
 
 ## What is implemented
 
-- `models/etf.py`: remaining-depth VWAP, FX-adjusted basket comparisons with fees, weighted exposure and sequential hypothetical-fill checks, fixed-price tender unwind estimates. Supply `--gross-limit` and `--net-limit` from the actual session; otherwise risk eligibility is unknown (`null`).
+- `models/etf.py`: remaining-depth VWAP, FX-adjusted basket comparisons with fees, weighted exposure and sequential hypothetical-fill checks, fixed-price tender unwind estimates, and manual converter comparisons. Supply `--gross-limit` and `--net-limit` from the actual session; otherwise risk eligibility is unknown (`null`).
 - `volatility/`: V1 uses a typed state, news-triggered integrated-variance forecast, all-option Black-Scholes values and Greeks, executable-price edges after commissions/hedging reserves, ATM straddle selection, hysteresis exits, RTM hedge band, put-call-parity scan, and structured decision data. All thresholds are in `VolatilityConfig`.
 - `reference/`: unmodified official starter scripts. These require their own third-party dependencies and some can submit trades; do not use them as the project entry point.
 - `CASES.md`: source links, rules, ambiguities, and next implementation steps.
@@ -137,6 +137,6 @@ inspect account state and reconcile its journal before manually restarting.
 
 Read [OPERATIONS.md](OPERATIONS.md) for exact commands and recovery instructions. Default commands remain read-only. `--plan` reports the next bot action; `--trade --source api` enables orders and tender acceptance on the configured simulated account.
 
-Volatility uses weekly news, small option entries, RTM delta hedges, and convergence/time exits. ETF trading prioritizes FX hedging and inventory unwinds, then selective fixed-price tenders. Basket trading is separately enabled with `--basket`. Do not enable `--trade` until a practice heat has been explicitly authorized.
+Volatility uses weekly news, small option entries, RTM delta hedges, and convergence/time exits. ETF trading keeps the natural RITC/USD offset while unwinding equities, converts final net USD last, and selectively accepts fixed-price tenders. It loudly pauses for a manual ETF Creation or Redemption when that route beats direct liquidation. Basket trading is separately enabled with `--basket`. Do not enable `--trade` until a practice heat has been explicitly authorized.
 
 Execution writes intent to disk, submits once, and confirms fills. Partial fills and uncertain outcomes stop the bot. This is a practice MVP, with conservative fixed sizing; it is not a proven profitable strategy. Snapshots are sequential reads, and replay does not simulate fills or P&L.

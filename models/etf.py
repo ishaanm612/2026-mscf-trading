@@ -6,6 +6,8 @@ from typing import Any, Iterable, Mapping
 WEIGHTS = {"BULL": 1, "BEAR": 1, "RITC": 2}
 EQUITY_FEE = 0.02
 DEFAULT_ENTRY_BUFFER_CAD = 0.10
+CONVERTER_BLOCK = 10_000
+CONVERTER_COST_USD = 1_500
 
 
 def exposure(positions: Mapping[str, float]) -> dict[str, float]:
@@ -64,8 +66,8 @@ def basket_opportunity(snapshot: Mapping[str, Any], direction: int, quantity: in
     ``direction=1`` sells the CAD BULL/BEAR basket and buys USD RITC; the
     inverse direction buys the basket and sells RITC.  USD is traded in the
     same direction as RITC to neutralize the currency created or consumed by
-    that leg.  Currency quantity is rounded *up* to fund RITC plus its stated
-    per-share fee, so a plan never understates the required USD hedge.
+    that leg. A RITC purchase rounds required USD up after its fee; a RITC
+    sale rounds net USD proceeds down after its fee.
 
     The reported edge includes the three equity commissions and all observed
     bid/ask crossing through the VWAPs.  ``entry_buffer_cad`` is an additional
@@ -92,10 +94,11 @@ def basket_opportunity(snapshot: Mapping[str, Any], direction: int, quantity: in
     basket_prices = {ticker: vwap(books[ticker], stock_action, quantity) for ticker in ("BULL", "BEAR")}
     etf_price = vwap(books["RITC"], etf_action, quantity)
     # The price and commission are USD/share; USD trades in whole currency units.
-    required_usd = quantity * (etf_price + EQUITY_FEE)
+    required_usd = quantity * (etf_price + direction * EQUITY_FEE)
     # Do not turn an exact decimal-cent amount into an extra USD unit merely
     # because binary floats represent it as e.g. 24830.000000000004.
-    usd_quantity = math.ceil(required_usd - 1e-9)
+    usd_quantity = (math.ceil(required_usd - 1e-9) if direction == 1
+                    else math.floor(required_usd + 1e-9))
     fx_price = vwap(books["USD"], etf_action, usd_quantity)
     basket_cad = sum(basket_prices.values())
     etf_cad = etf_price * fx_price
@@ -119,6 +122,108 @@ def basket_opportunity(snapshot: Mapping[str, Any], direction: int, quantity: in
     }
 
 
+def tender_opportunity(snapshot: Mapping[str, Any], offer: Mapping[str, Any]) -> dict[str, Any]:
+    """Price a fixed RITC tender through liquidation and net USD conversion.
+
+    RITC inventory and its USD cash leg naturally offset while the position is
+    worked. The strategy therefore converts only the final net USD profit or
+    loss after liquidation, avoiding a needless gross FX round trip.
+    """
+
+    report = {"tender_id": offer["tender_id"], "decision": "REVIEW"}
+    try:
+        if offer["ticker"] != "RITC" or not offer["is_fixed_bid"]:
+            raise ValueError("only fixed-price RITC tenders supported")
+        action, quantity = offer["action"], offer["quantity"]
+        if action not in ("BUY", "SELL"):
+            raise ValueError("unknown tender action")
+        if not isinstance(quantity, (int, float)) or quantity <= 0 or int(quantity) != quantity:
+            raise ValueError("tender quantity must be a positive integer")
+        quantity = int(quantity)
+        unwind = "SELL" if action == "BUY" else "BUY"
+        market = vwap(snapshot["books"]["RITC"], unwind, quantity)
+        edge_usd = ((market - offer["price"]) * (1 if action == "BUY" else -1) - EQUITY_FEE) * quantity
+        if edge_usd:
+            fx_action = "SELL" if edge_usd > 0 else "BUY"
+            fx_quantity = max(1, math.ceil(abs(edge_usd) - 1e-9))
+            fx_price = vwap(snapshot["books"]["USD"], fx_action, fx_quantity)
+            edge_cad = edge_usd * fx_price
+        else:
+            fx_action, fx_price, edge_cad = "NONE", None, 0.0
+        report.update(estimated_unwind_profit_usd=edge_usd,
+                      estimated_unwind_profit_cad=edge_cad,
+                      net_fx_action=fx_action, net_fx_price=fx_price,
+                      note="Full-depth static estimate; only final net USD is converted after liquidation.")
+    except (ValueError, KeyError) as error:
+        report["skip"] = str(error)
+    return report
+
+
+def manual_converter_opportunities(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Compare supported manual converters with direct liquidation of inventory.
+
+    Only the human-operated converter itself is recommended. Creation requires
+    the account to already own one 10,000-share block of both stocks against a
+    RITC short. Redemption requires a 10,000-unit RITC long; resulting stocks
+    can either offset shorts or be sold by the normal inventory reducer.
+    """
+
+    positions = {row["ticker"]: int(row["position"]) for row in snapshot["securities"]}
+    books = snapshot["books"]
+    block = CONVERTER_BLOCK
+    results: list[dict[str, Any]] = []
+    try:
+        converter_cad = CONVERTER_COST_USD * vwap(books["USD"], "BUY", CONVERTER_COST_USD)
+    except (ValueError, KeyError):
+        return results
+
+    if positions.get("RITC", 0) >= block:
+        try:
+            ritc_sale_usd = block * (vwap(books["RITC"], "SELL", block) - EQUITY_FEE)
+            direct_value = ritc_sale_usd * vwap(books["USD"], "SELL", math.ceil(ritc_sale_usd - 1e-9))
+            stock_value = 0.0
+            for ticker in ("BULL", "BEAR"):
+                offset = min(block, max(0, -positions.get(ticker, 0)))
+                if offset:
+                    stock_value += offset * (vwap(books[ticker], "BUY", offset) + EQUITY_FEE)
+                remainder = block - offset
+                if remainder:
+                    stock_value += remainder * (vwap(books[ticker], "SELL", remainder) - EQUITY_FEE)
+            advantage = stock_value - converter_cad - direct_value
+            results.append({"converter": "ETF-Redemption", "manual_action": "UNWIND",
+                            "blocks": positions["RITC"] // block, "block_size": block,
+                            "convert_from": {"RITC": block},
+                            "convert_to": {"BULL": block, "BEAR": block},
+                            "estimated_advantage_cad": advantage,
+                            "recommended": advantage > 0,
+                            "reason": "manual redemption beats direct RITC liquidation" if advantage > 0
+                                      else "direct RITC liquidation is cheaper"})
+        except (ValueError, KeyError):
+            pass
+
+    creation_blocks = min(max(0, -positions.get("RITC", 0)) // block,
+                          max(0, positions.get("BULL", 0)) // block,
+                          max(0, positions.get("BEAR", 0)) // block)
+    if creation_blocks:
+        try:
+            ritc_cover_usd = block * (vwap(books["RITC"], "BUY", block) + EQUITY_FEE)
+            avoided_cover = ritc_cover_usd * vwap(books["USD"], "BUY", math.ceil(ritc_cover_usd - 1e-9))
+            forgone_stock_sales = sum(block * (vwap(books[ticker], "SELL", block) - EQUITY_FEE)
+                                      for ticker in ("BULL", "BEAR"))
+            advantage = avoided_cover - forgone_stock_sales - converter_cad
+            results.append({"converter": "ETF-Creation", "manual_action": "WIND",
+                            "blocks": creation_blocks, "block_size": block,
+                            "convert_from": {"BULL": block, "BEAR": block},
+                            "convert_to": {"RITC": block},
+                            "estimated_advantage_cad": advantage,
+                            "recommended": advantage > 0,
+                            "reason": "manual creation beats direct basket liquidation" if advantage > 0
+                                      else "direct basket liquidation is cheaper"})
+        except (ValueError, KeyError):
+            pass
+    return results
+
+
 def analyze(snapshot: Mapping[str, Any], quantity: int = 1000, gross_limit: float | None = None,
             net_limit: float | None = None) -> dict[str, Any]:
     """Evaluate ETF basket and tender opportunities without trading.
@@ -138,21 +243,7 @@ def analyze(snapshot: Mapping[str, Any], quantity: int = 1000, gross_limit: floa
             results.append(basket_opportunity(snapshot, direction, quantity, gross_limit, net_limit))
         except ValueError as error:
             results.append({"direction": direction, "skip": str(error)})
-    tenders = []
-    for offer in snapshot.get("tenders", []):
-        report = {"tender_id": offer["tender_id"], "decision": "REVIEW"}
-        try:
-            if offer["ticker"] != "RITC" or not offer["is_fixed_bid"]:
-                raise ValueError("only fixed-price RITC tenders supported")
-            action, q = offer["action"], offer["quantity"]
-            if action not in ("BUY", "SELL"):
-                raise ValueError("unknown tender action")
-            unwind = "SELL" if action == "BUY" else "BUY"
-            market = vwap(snapshot["books"]["RITC"], unwind, q)
-            edge = (market - offer["price"]) * (1 if action == "BUY" else -1) - EQUITY_FEE
-            report["estimated_unwind_profit_usd"] = edge * q
-            report["note"] = "Static depth estimate; unwind needs child orders and fresh quotes."
-        except (ValueError, KeyError) as error:
-            report["skip"] = str(error)
-        tenders.append(report)
-    return {"exposure": exposure(positions), "opportunities": results, "tenders": tenders}
+    tenders = [tender_opportunity(snapshot, offer) for offer in snapshot.get("tenders", [])]
+    converters = manual_converter_opportunities(snapshot)
+    return {"exposure": exposure(positions), "opportunities": results,
+            "tenders": tenders, "manual_converters": converters}

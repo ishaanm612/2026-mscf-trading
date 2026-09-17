@@ -141,9 +141,52 @@ def _size_for_edge(straddle: StraddleOpportunity, portfolio: PortfolioGreeks, st
     vega_per_straddle = abs(straddle.call.vega + straddle.put.vega) * config.contract_multiplier
     gamma_capacity = max(0, int((config.max_portfolio_gamma - abs(portfolio.gamma)) / max(gamma_per_straddle, 1e-9)))
     vega_capacity = max(0, int((config.max_portfolio_vega - abs(portfolio.vega)) / max(vega_per_straddle, 1e-9)))
-    capacity = min(config.max_straddle_contracts, gross_capacity, net_capacity, gamma_capacity, vega_capacity)
+    premium_notional = (straddle.call.executable_price + straddle.put.executable_price) * config.contract_multiplier
+    notional_capacity = max(0, int(config.target_entry_notional / max(premium_notional, 1e-9)))
+    capacity = min(config.max_straddle_contracts, gross_capacity, net_capacity, gamma_capacity, vega_capacity,
+                   notional_capacity)
     edge_fraction = min(1.0, straddle.expected_edge_per_contract / config.edge_for_full_risk)
     return max(0, int(capacity * edge_fraction))
+
+
+def _straddle_entry_children(straddle: StraddleOpportunity, quantity: int, state: MarketState,
+                             portfolio: PortfolioGreeks, config: VolatilityConfig) -> tuple[DesiredTrade, ...]:
+    """Split a large straddle into alternating legal call/put child orders.
+
+    The exchange caps options at a child-order size.  Alternating legs limits
+    temporary directional delta to one child instead of accumulating every
+    call before its matching put.  Each proposed child also fits the internal
+    delta boundary before the paired leg arrives.
+
+    :param straddle: Selected executable ATM pair.
+    :param quantity: Positive contracts per option before side direction.
+    :param state: Snapshot containing server order caps.
+    :param portfolio: Confirmed inventory Greeks before entry.
+    :param config: Strategy limits and contract multiplier.
+    :returns: Ordered, signed legal child trades; empty when no safe child fits.
+    """
+
+    call_cap = order_capacity(state, straddle.call.symbol)
+    put_cap = order_capacity(state, straddle.put.symbol)
+    if quantity <= 0 or not call_cap or not put_cap:
+        return ()
+    signed = 1 if straddle.side == "BUY" else -1
+    # A single unpaired child must be legal even before the next fresh cycle
+    # can submit its matching leg. Subsequent cycles use confirmed inventory
+    # and may insert the normal RTM hedge before continuing this queue.
+    delta_per_contract = max(abs(straddle.call.delta), abs(straddle.put.delta)) * config.contract_multiplier
+    delta_child_cap = int(config.max_safe_delta / max(delta_per_contract, 1e-9))
+    if delta_child_cap <= 0:
+        return ()
+    remaining = quantity
+    children: list[DesiredTrade] = []
+    while remaining:
+        child = min(remaining, call_cap, put_cap, delta_child_cap)
+        quantity_signed = signed * child
+        children.extend((DesiredTrade(straddle.call.symbol, quantity_signed, "ATM volatility straddle"),
+                         DesiredTrade(straddle.put.symbol, quantity_signed, "ATM volatility straddle")))
+        remaining -= child
+    return tuple(children)
 
 
 def _incomplete_option_inventory(models: tuple[OptionModel, ...]) -> bool:
@@ -356,27 +399,33 @@ class VolatilityStrategy:
             if self._convergence_prediction < self.config.convergence_min_expected_pnl:
                 return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
                                         "wait: learned convergence return is insufficient", age)
-        quantity = min(_size_for_edge(straddle, portfolio, state, self.config),
-                       order_capacity(state, straddle.call.symbol),
-                       order_capacity(state, straddle.put.symbol))
-        proposed = {straddle.call.symbol: quantity, straddle.put.symbol: quantity}
-        proposed_budget = exit_budget(state, proposed, cycle, self.config)
-        # Two entry cycles plus useful holding time must precede the exit window.
-        entry_deadline = proposed_budget.liquidation_tick - 2 * proposed_budget.ticks_per_order - self.config.minimum_holding_ticks
-        if self.config.close_tick is not None:
-            entry_deadline = min(entry_deadline, self.config.close_tick - 2 * proposed_budget.ticks_per_order - self.config.minimum_holding_ticks)
-        self.timing.update(entry_deadline_tick=entry_deadline, proposed_exit_budget=asdict(proposed_budget))
-        if state.current_tick >= entry_deadline:
+        quantity = _size_for_edge(straddle, portfolio, state, self.config)
+        proposed_budget = None
+        entry_deadline = -1
+        # A late news event may not leave enough time for the maximum volume.
+        # Step down only as far as needed to retain an entry that can be fully
+        # liquidated, rather than rejecting a still-viable smaller position.
+        while quantity:
+            proposed = {straddle.call.symbol: quantity, straddle.put.symbol: quantity}
+            proposed_budget = exit_budget(state, proposed, cycle, self.config)
+            entry_deadline = proposed_budget.liquidation_tick - 2 * proposed_budget.ticks_per_order - self.config.minimum_holding_ticks
+            if self.config.close_tick is not None:
+                entry_deadline = min(entry_deadline, self.config.close_tick - 2 * proposed_budget.ticks_per_order - self.config.minimum_holding_ticks)
+            if state.current_tick < entry_deadline:
+                break
+            quantity -= 1
+        self.timing.update(entry_deadline_tick=entry_deadline,
+                           proposed_exit_budget=None if proposed_budget is None else asdict(proposed_budget))
+        if quantity == 0:
             return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
                                     "wait: insufficient time to enter, hold, and liquidate", age)
-        signed = quantity if straddle.side == "BUY" else -quantity
-        if quantity == 0:
-            return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (), "wait: straddle edge below entry threshold", age)
+        children = _straddle_entry_children(straddle, quantity, state, portfolio, self.config)
+        if not children:
+            return StrategyDecision(state, forecast, models, portfolio, straddle, parity, (),
+                                    "wait: straddle child would exceed order or delta limit", age)
         self._used_entry_news = frozenset(forecast.recognized_news_ids)
         self._entry_edge = straddle.expected_edge_per_contract
-        return StrategyDecision(state, forecast, models, portfolio, straddle, parity,
-                                (DesiredTrade(straddle.call.symbol, signed, "ATM volatility straddle"),
-                                 DesiredTrade(straddle.put.symbol, signed, "ATM volatility straddle")),
+        return StrategyDecision(state, forecast, models, portfolio, straddle, parity, children,
                                 "enter: new news and cost-adjusted ATM straddle edge", age)
 
     def explain(self, decision: StrategyDecision) -> dict[str, Any]:

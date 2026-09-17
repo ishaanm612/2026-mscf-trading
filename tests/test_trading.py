@@ -11,15 +11,19 @@ from unittest.mock import MagicMock, patch
 from bot import Bot
 from client import Client, RITReadError, RITTransportError
 from execution import Executor
+from models import etf
 from models.news import forecast
 from risk import check, RiskError
-from run import demo
+from run import demo, format_manual_converter_alert
 
 
 class Exchange:
     """Fill market orders immediately and update inventory like the RIT account API."""
     def __init__(self, case):
         self.state = demo(case)
+        if case == "etf":
+            cash_limit = next(limit for limit in self.state["limits"] if limit["name"] == "cash")
+            cash_limit.update(gross_limit=10_000_000, net_limit=10_000_000)
         self.orders = {}
         self.requests = []
         self.fail = False
@@ -41,14 +45,21 @@ class Exchange:
             raise TimeoutError("Unknown exchange outcome")
         if endpoint.startswith("tenders/"):
             offer = next(o for o in self.state["tenders"] if o["tender_id"] == int(endpoint.split("/")[-1]))
-            self.move(offer["ticker"], offer["quantity"] * (1 if offer["action"] == "BUY" else -1))
+            signed = offer["quantity"] * (1 if offer["action"] == "BUY" else -1)
+            self.move(offer["ticker"], signed)
+            self.move("USD", -signed * offer["price"])
             self.state["tenders"] = []
             return {"success": True}
         oid = len(self.orders) + 1
         filled = params["quantity"] // 2 if self.partial else params["quantity"]
         self.orders[oid] = {"order_id": oid, "quantity_filled": filled,
                             "status": "CANCELLED" if self.partial else "TRANSACTED"}
-        self.move(params["ticker"], filled * (1 if params["action"] == "BUY" else -1))
+        signed = filled * (1 if params["action"] == "BUY" else -1)
+        self.move(params["ticker"], signed)
+        if params["ticker"] == "RITC":
+            side = "asks" if signed > 0 else "bids"
+            price = self.state["books"]["RITC"][side][0]["price"]
+            self.move("USD", -signed * price - abs(signed) * .02)
         return self.orders[oid].copy()
 
     def move(self, ticker, quantity):
@@ -350,8 +361,96 @@ class Trading(unittest.TestCase):
             bot = Bot(exchange, executor, case="etf", gross_limit=300000, net_limit=200000)
             try:
                 self.assertEqual(bot.step(exchange.snapshot())["tender_id"], 1)
-                self.assertEqual(bot.step(exchange.snapshot())["quantity"], -1000)
-                self.assertEqual(bot.step(exchange.snapshot())["quantity"], -1000)
+                self.assertEqual(bot.step(exchange.snapshot())["quantity"], -2000)
+                fx = bot.step(exchange.snapshot())
+                self.assertEqual(fx["ticker"], "USD")
+                self.assertLess(fx["quantity"], 0)
+                self.assertTrue(all(row["position"] == 0 for row in exchange.state["securities"]))
+            finally:
+                executor.close()
+
+    def test_large_profitable_tender_uses_server_risk_and_fast_unwind_children(self):
+        """Permit a full legal tender and reduce it in 10,000-share children."""
+
+        exchange = Exchange("etf")
+        exchange.state["tenders"] = [{"tender_id": 2, "ticker": "RITC", "action": "BUY",
+                                      "is_fixed_bid": True, "price": 20, "quantity": 78000, "expires": 30}]
+        with tempfile.TemporaryDirectory() as directory:
+            executor = Executor(exchange, Path(directory) / "journal.jsonl")
+            bot = Bot(exchange, executor, case="etf", gross_limit=300000, net_limit=200000)
+            try:
+                snapshot = exchange.snapshot()
+                assessment = bot.tender_assessments(snapshot, bot.position_map(snapshot),
+                                                    etf.analyze(snapshot, 1000, 300000, 200000))[0]
+                self.assertEqual(assessment["decision"], "ACCEPT")
+                self.assertIn("clears buffer", assessment["reason"])
+                self.assertEqual(bot.step(exchange.snapshot())["tender_id"], 2)
+                manual = bot.step(exchange.snapshot())
+                self.assertEqual(manual["manual_converter"]["converter"], "ETF-Redemption")
+                alert = format_manual_converter_alert(manual["manual_converter"])
+                self.assertIn("MANUAL UNWIND REQUIRED", alert)
+                self.assertIn("PAUSE AUTOMATED UNWIND", alert)
+                # If converter economics deteriorate, direct liquidation still
+                # uses the full legal child rather than the basket entry size.
+                for ticker in ("BULL", "BEAR"):
+                    exchange.state["books"][ticker]["bids"] = [{"price": 1, "quantity": 1000000}]
+                self.assertEqual(bot.step(exchange.snapshot())["quantity"], -10000)
+            finally:
+                executor.close()
+
+    def test_tender_assessment_names_a_negative_unwind_rejection(self):
+        """Operators receive the binding tender rejection rather than a silent wait."""
+
+        snapshot = demo("etf")
+        snapshot["tenders"] = [{"tender_id": 3, "ticker": "RITC", "action": "BUY",
+                                 "is_fixed_bid": True, "price": 30, "quantity": 1000, "expires": 20}]
+        bot = Bot(None, case="etf", gross_limit=300000, net_limit=200000)
+        assessment = bot.tender_assessments(snapshot, bot.position_map(snapshot),
+                                            etf.analyze(snapshot, 1000, 300000, 200000))[0]
+        self.assertEqual(assessment["decision"], "REJECT")
+        self.assertIn("unwind edge", assessment["reason"])
+
+    def test_tender_near_offer_expiry_remains_eligible(self):
+        """Offer expiry is an acceptance deadline, not a liquidation deadline."""
+
+        snapshot = demo("etf")
+        snapshot["case"]["tick"] = 28
+        snapshot["tenders"] = [{"tender_id": 6, "ticker": "RITC", "action": "BUY",
+                                 "is_fixed_bid": True, "price": 20, "quantity": 1000, "expires": 30}]
+        bot = Bot(None, case="etf", gross_limit=300000, net_limit=200000)
+        assessment = bot.tender_assessments(snapshot, bot.position_map(snapshot),
+                                            etf.analyze(snapshot, 1000, 300000, 200000))[0]
+        self.assertEqual(assessment["decision"], "ACCEPT")
+
+    def test_tender_assessment_reserves_time_for_full_liquidation(self):
+        """Reject a large tender when its legal child sequence cannot finish."""
+
+        snapshot = demo("etf")
+        snapshot["case"]["tick"] = 261
+        snapshot["tenders"] = [{"tender_id": 4, "ticker": "RITC", "action": "BUY",
+                                 "is_fixed_bid": True, "price": 20, "quantity": 100000, "expires": 290}]
+        bot = Bot(None, case="etf", gross_limit=300000, net_limit=200000)
+        assessment = bot.tender_assessments(snapshot, bot.position_map(snapshot),
+                                            etf.analyze(snapshot, 1000, 300000, 200000))[0]
+        self.assertEqual(assessment["decision"], "REJECT")
+        self.assertIn("insufficient time", assessment["reason"])
+
+    def test_tender_is_repriced_from_a_fresh_snapshot_before_acceptance(self):
+        """A stale profitable offer cannot survive a changed fresh preflight."""
+
+        exchange = Exchange("etf")
+        exchange.state["tenders"] = [{"tender_id": 5, "ticker": "RITC", "action": "BUY",
+                                      "is_fixed_bid": True, "price": 20, "quantity": 2000, "expires": 30}]
+        stale = exchange.snapshot()
+        exchange.state["tenders"][0]["price"] = 30
+        with tempfile.TemporaryDirectory() as directory:
+            executor = Executor(exchange, Path(directory) / "journal.jsonl")
+            bot = Bot(exchange, executor, case="etf", gross_limit=300000, net_limit=200000)
+            try:
+                result = bot.step(stale)
+                self.assertIn("fresh tender rejected", result["wait"])
+                self.assertEqual(result["tender_assessment"]["decision"], "REJECT")
+                self.assertFalse(any(event[1].startswith("tenders/") for event in exchange.requests))
             finally:
                 executor.close()
 

@@ -60,6 +60,44 @@ class Models(unittest.TestCase):
         self.assertFalse(report["eligible_after_buffer"])
         self.assertTrue(report["within_configured_limits"])
 
+    def test_short_ritc_fx_leg_uses_net_sale_proceeds(self):
+        """A short RITC leg sells USD proceeds after its USD commission."""
+
+        report = etf.basket_opportunity(demo("etf"), -1, 1000, 300000, 200000)
+        self.assertEqual(report["fx_leg"], {"ticker": "USD", "quantity": -24770, "action": "SELL"})
+
+    def test_tender_profit_is_converted_from_net_usd_to_cad(self):
+        """Tender scoring converts only final net USD profit at executable FX."""
+
+        snapshot = demo("etf")
+        offer = {"tender_id": 2, "ticker": "RITC", "action": "BUY",
+                 "quantity": 1000, "price": 24.70, "is_fixed_bid": True}
+        report = etf.tender_opportunity(snapshot, offer)
+        self.assertAlmostEqual(report["estimated_unwind_profit_usd"], 70.0)
+        self.assertAlmostEqual(report["estimated_unwind_profit_cad"], 69.3)
+
+    def test_converter_recommendations_follow_inventory_direction(self):
+        """Long RITC redeems; a covered RITC short creates ETF units."""
+
+        redemption = demo("etf")
+        next(row for row in redemption["securities"] if row["ticker"] == "RITC")["position"] = 10000
+        rec = next(item for item in etf.manual_converter_opportunities(redemption)
+                   if item["converter"] == "ETF-Redemption")
+        self.assertEqual(rec["manual_action"], "UNWIND")
+        self.assertTrue(rec["recommended"])
+
+        creation = demo("etf")
+        for row in creation["securities"]:
+            if row["ticker"] in {"BULL", "BEAR"}:
+                row["position"] = 10000
+            elif row["ticker"] == "RITC":
+                row["position"] = -10000
+        creation["books"]["RITC"]["asks"] = [{"price": 30, "quantity": 1000000}]
+        rec = next(item for item in etf.manual_converter_opportunities(creation)
+                   if item["converter"] == "ETF-Creation")
+        self.assertEqual(rec["manual_action"], "WIND")
+        self.assertTrue(rec["recommended"])
+
 
 if __name__ == "__main__":
     unittest.main()

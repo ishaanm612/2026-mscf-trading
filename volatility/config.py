@@ -21,6 +21,7 @@ class VolatilityConfig:
     :param exit_edge_per_contract: Net edge below which an open straddle exits.
     :param max_option_position_fraction: Fraction of server option capacity V1 uses.
     :param max_straddle_contracts: Absolute per-strike concentration cap.
+    :param target_entry_notional: Target option premium notional for a strong entry.
     :param max_portfolio_gamma: Internal cap on absolute portfolio gamma.
     :param max_portfolio_vega: Internal cap on absolute portfolio vega.
     :param edge_for_full_risk: Net edge that earns the full available risk budget.
@@ -46,11 +47,18 @@ class VolatilityConfig:
     rtm_commission_per_share: float = 0.02
     entry_edge_per_contract: float = 4.0
     exit_edge_per_contract: float = 1.0
-    max_option_position_fraction: float = 0.60
-    max_straddle_contracts: int = 300
-    max_portfolio_gamma: float = 1500.0
-    max_portfolio_vega: float = 80000.0
-    edge_for_full_risk: float = 32.0
+    # Use the full published option allocation. A 450-contract straddle stays
+    # inside the 6,000-share interim-delta band while serial child orders are
+    # being filled; the server's net limit remains an additional hard gate.
+    max_option_position_fraction: float = 1.00
+    max_straddle_contracts: int = 450
+    max_portfolio_gamma: float = 10000.0
+    max_portfolio_vega: float = 540000.0
+    # Size strong signals to the configured 450-contract concentration cap at
+    # typical ATM premiums. The server gross/net limits and the 6,000-share
+    # interim-delta gate remain binding safety controls.
+    target_entry_notional: float = 1750000.0
+    edge_for_full_risk: float = 8.0
     news_entry_window_ticks: int = 10
     unannounced_sigma: float = 0.20
     take_profit_remaining_fraction: float = 0.25
