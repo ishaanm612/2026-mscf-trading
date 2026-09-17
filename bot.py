@@ -68,7 +68,15 @@ class Bot:
 
     def submit(self, snapshot: Mapping[str, Any], ticker: str, quantity: int, reason: str,
                deltas: Mapping[str, float] | None = None) -> dict[str, Any]:
-        """Validate then optionally submit one signed market order."""
+        """Validate then optionally submit one signed market order.
+
+        :param snapshot: Fresh account state.
+        :param ticker: Instrument ticker.
+        :param quantity: Signed order quantity.
+        :param reason: Audit explanation.
+        :param deltas: Current instrument delta weights.
+        :returns: Submitted or planned action.
+        """
         risk.check(snapshot, ticker, quantity, self.case, deltas, self.gross_limit, self.net_limit)
         action = {"ticker": ticker, "quantity": quantity, "reason": reason}
         if self.executor and self.case == "volatility":
@@ -85,6 +93,7 @@ class Bot:
                 return {"wait": "account changed before submission; replan from confirmed positions"}
             risk.check(fresh, ticker, quantity, self.case, deltas, self.gross_limit, self.net_limit)
         if self.executor:
+            # Re-read case immediately before mutation; do not trade an older snapshot.
             try:
                 current = self.client.get("case")
             except RITReadError:
@@ -100,11 +109,16 @@ class Bot:
                 self.pending_volatility_trades.clear()
                 return {"wait": "snapshot expired before submission; replan from fresh state"}
             fill = self.executor.order(ticker, quantity)
-            action["fill"] = dict(fill)
+            if self.case == "etf":
+                action["fill"] = dict(fill)
         return action
 
     def step(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
-        """Produce at most one safe action from a fresh snapshot."""
+        """Produce at most one safe action from a fresh snapshot.
+
+        :param snapshot: Fresh RIT case snapshot.
+        :returns: Action or wait explanation.
+        """
         state = snapshot["case"]
         if self.last_tick is not None and (state["tick"] < self.last_tick or state.get("period") != self.last_period):
             self.held_basket = None
@@ -124,11 +138,20 @@ class Bot:
 
     @staticmethod
     def position_map(snapshot: Mapping[str, Any]) -> dict[str, float]:
-        """Extract account inventory for detecting fills outside this bot."""
+        """Extract account inventory for detecting fills outside this bot.
+
+        :param snapshot: Account snapshot with confirmed security positions.
+        :returns: Instrument quantities without assuming who placed the orders.
+        """
+
         return {str(row["ticker"]): float(row["position"]) for row in snapshot["securities"]}
 
     def volatility_step(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
-        """Execute at most one validated V1 volatility action from a fresh decision."""
+        """Execute at most one validated V1 volatility action from a fresh decision.
+
+        :param snapshot: Current coherent RIT volatility snapshot.
+        :returns: Submitted action or an explainable no-trade decision.
+        """
         actual_positions = self.position_map(snapshot)
         if (self.expected_volatility_positions is not None
                 and actual_positions != self.expected_volatility_positions):
@@ -140,6 +163,7 @@ class Bot:
         securities = {str(item["ticker"]): item for item in snapshot["securities"]}
         deltas = {"RTM": 1.0, **{item.quote.symbol: 100.0 * item.fair.delta for item in decision.models}}
         if self.volatility_strategy.liquidating:
+            # Discard pending entry legs once the inventory exit deadline arrives.
             self.pending_volatility_trades.clear()
         if self.flatten_only:
             self.pending_volatility_trades = [DesiredTrade(symbol, -int(row["position"]), "flatten option")
@@ -155,6 +179,10 @@ class Bot:
                           and not self.flatten_only and not pending_exit)
         forced_option_exit = decision.reason.startswith("exit:") and any(item.quote.position for item in decision.models)
         if forced_option_exit and not pending_exit:
+            # Exit plans can cover hundreds of contracts. Submit only one
+            # legal child at a time. Queue alternating legs so normal delta
+            # hedges cannot split a pair into directional inventory while the
+            # serial exit is in progress.
             self.pending_volatility_trades.clear()
             remaining = [(item.quote.symbol, -int(item.quote.position))
                          for item in decision.models if item.quote.position]
@@ -177,6 +205,8 @@ class Bot:
                 return {"wait": "option exit lacks a legal child order", "decision": decision_fields}
             trade = self.pending_volatility_trades.pop(0)
         elif priority_hedge:
+            # Only the 6,000-delta safety hedge may interrupt the pair.
+            # Ordinary band hedges wait until both straddle legs are confirmed.
             trade = decision.desired_trades[0]
         else:
             if self.pending_volatility_trades and self.pending_volatility_trades[0].reason == "ATM volatility straddle":
@@ -187,6 +217,8 @@ class Bot:
                 valid = any(item.symbol == pending.symbol and item.side == side for item in opportunities)
                 if not valid or decision.reason.startswith("exit:"):
                     self.pending_volatility_trades.clear()
+                    # The pair's thesis no longer supports completing the second
+                    # leg. Explicitly unwind the confirmed first leg instead.
                     self.pending_volatility_trades.extend(
                         DesiredTrade(item.quote.symbol, -item.quote.position, "aborted straddle unwind")
                         for item in decision.models if item.quote.position)
@@ -201,6 +233,8 @@ class Bot:
         try:
             action = self.submit(snapshot, trade.symbol, trade.quantity, reason, deltas)
         except risk.RiskError as error:
+            # All RiskError gates run before Executor.order: no mutation occurred.
+            # Discard dependent legs and let the next fresh decision hedge or exit.
             self.pending_volatility_trades.clear()
             rejection = {"symbol": trade.symbol, "quantity": trade.quantity,
                          "reason": str(error), "submitted": False}
@@ -221,6 +255,7 @@ class Bot:
                 continue
             ticker = row["ticker"]
             q = 10 if row["signal"] == "BUY" else -10
+            # Small MVP inventory caps, stricter than case limits.
             if abs(securities[ticker]["position"] + q) > 50 or analysis["option_gross"] + abs(q) > 200:
                 continue
             projected_delta = analysis["portfolio_delta_shares"] + q*deltas[ticker]
@@ -302,7 +337,13 @@ class Bot:
         return {"wait": "no eligible ETF trade"}
 
     def unwind_etf(self, snapshot: Mapping[str, Any], positions: Mapping[str, float]) -> dict[str, Any]:
-        """Reduce the largest weighted holding in a depth-supported child."""
+        """Reduce the largest weighted holding in a depth-supported child.
+
+        ETF risk is greatest while an unpaired holding remains. Use up to the
+        venue's 10,000-share stock-order limit rather than the smaller basket
+        entry size, while requiring all shares of the selected child to be
+        executable against displayed depth.
+        """
         securities = {str(item["ticker"]): item for item in snapshot["securities"]}
         for ticker in sorted(etf.WEIGHTS, key=lambda t: abs(positions[t])*etf.WEIGHTS[t], reverse=True):
             if not positions[ticker]:
@@ -326,7 +367,12 @@ class Bot:
 
     def choose_tender(self, snapshot: Mapping[str, Any], positions: Mapping[str, float],
                       analysis: Mapping[str, Any]) -> dict[str, Any] | None:
-        """Accept one fixed RITC tender only when its stressed liquidation remains attractive."""
+        """Accept one fixed RITC tender only while existing equity inventory is flat.
+
+        Full visible unwind depth is required for the complete tender. The
+        modeled profit must clear a size-aware liquidation/slippage reserve;
+        the server and local weighted-risk checks bound tender size.
+        """
         assessments = self.tender_assessments(snapshot, positions, analysis)
         for assessment in assessments:
             if assessment["decision"] != "ACCEPT":
@@ -376,7 +422,12 @@ class Bot:
 
     def tender_assessments(self, snapshot: Mapping[str, Any], positions: Mapping[str, float],
                            analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Explain accept/reject decisions for every visible ETF tender."""
+        """Explain accept/reject decisions for every visible ETF tender.
+
+        The output is deliberately suitable for the operator console: it
+        preserves the full-depth estimate and names the first binding gate,
+        including inventory priority and server-weighted risk rejection.
+        """
         reports = {item["tender_id"]: item for item in analysis.get("tenders", [])}
         existing_inventory = any(positions.get(ticker, 0) for ticker in etf.WEIGHTS)
         assessments: list[dict[str, Any]] = []
