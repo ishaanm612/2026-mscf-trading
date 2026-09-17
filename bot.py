@@ -13,14 +13,24 @@ from volatility.signals import find_mispricings
 
 
 ETF_UNWIND_MAX_CHILD = 10_000
-ETF_TENDER_MIN_UNWIND_PROFIT_PER_UNIT_CAD = 0.0025
 ETF_TENDER_TICKS_PER_ACTION = 3
 ETF_TENDER_LIQUIDATION_BUFFER_TICKS = 5
+ETF_BASKET_LAST_ENTRY_TICK = 250
 
 
 def clip(position: float, size: int) -> int:
     """Keep the sign, cap absolute size, and truncate fractional currency units."""
     return int(math.copysign(min(abs(position), size), position)) if position else 0
+
+
+def _fill_price(order: Mapping[str, Any] | None, fallback: float) -> float:
+    """Prefer an exchange-reported fill VWAP while retaining a quoted fallback."""
+    if order:
+        for key in ("vwap", "avg_price", "price"):
+            value = order.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+                return float(value)
+    return fallback
 
 
 class Bot:
@@ -58,15 +68,7 @@ class Bot:
 
     def submit(self, snapshot: Mapping[str, Any], ticker: str, quantity: int, reason: str,
                deltas: Mapping[str, float] | None = None) -> dict[str, Any]:
-        """Validate then optionally submit one signed market order.
-
-        :param snapshot: Fresh account state.
-        :param ticker: Instrument ticker.
-        :param quantity: Signed order quantity.
-        :param reason: Audit explanation.
-        :param deltas: Current instrument delta weights.
-        :returns: Submitted or planned action.
-        """
+        """Validate then optionally submit one signed market order."""
         risk.check(snapshot, ticker, quantity, self.case, deltas, self.gross_limit, self.net_limit)
         action = {"ticker": ticker, "quantity": quantity, "reason": reason}
         if self.executor and self.case == "volatility":
@@ -83,7 +85,6 @@ class Bot:
                 return {"wait": "account changed before submission; replan from confirmed positions"}
             risk.check(fresh, ticker, quantity, self.case, deltas, self.gross_limit, self.net_limit)
         if self.executor:
-            # Re-read case immediately before mutation; do not trade an older snapshot.
             try:
                 current = self.client.get("case")
             except RITReadError:
@@ -98,15 +99,12 @@ class Bot:
                     raise RuntimeError("Snapshot expired before submission")
                 self.pending_volatility_trades.clear()
                 return {"wait": "snapshot expired before submission; replan from fresh state"}
-            self.executor.order(ticker, quantity)
+            fill = self.executor.order(ticker, quantity)
+            action["fill"] = dict(fill)
         return action
 
     def step(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
-        """Produce at most one safe action from a fresh snapshot.
-
-        :param snapshot: Fresh RIT case snapshot.
-        :returns: Action or wait explanation.
-        """
+        """Produce at most one safe action from a fresh snapshot."""
         state = snapshot["case"]
         if self.last_tick is not None and (state["tick"] < self.last_tick or state.get("period") != self.last_period):
             self.held_basket = None
@@ -122,26 +120,15 @@ class Bot:
             self.expected_volatility_positions = None
             return {"wait": "open account orders; waiting for fills or cancellation",
                     "open_order_ids": [order.get("order_id") for order in snapshot["orders"]]}
-
         return self.volatility_step(snapshot) if self.case == "volatility" else self.etf_step(snapshot)
 
     @staticmethod
     def position_map(snapshot: Mapping[str, Any]) -> dict[str, float]:
-        """Extract account inventory for detecting fills outside this bot.
-
-        :param snapshot: Account snapshot with confirmed security positions.
-        :returns: Instrument quantities without assuming who placed the orders.
-        """
-
+        """Extract account inventory for detecting fills outside this bot."""
         return {str(row["ticker"]): float(row["position"]) for row in snapshot["securities"]}
 
     def volatility_step(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
-        """Execute at most one validated V1 volatility action from a fresh decision.
-
-        :param snapshot: Current coherent RIT volatility snapshot.
-        :returns: Submitted action or an explainable no-trade decision.
-        """
-
+        """Execute at most one validated V1 volatility action from a fresh decision."""
         actual_positions = self.position_map(snapshot)
         if (self.expected_volatility_positions is not None
                 and actual_positions != self.expected_volatility_positions):
@@ -153,7 +140,6 @@ class Bot:
         securities = {str(item["ticker"]): item for item in snapshot["securities"]}
         deltas = {"RTM": 1.0, **{item.quote.symbol: 100.0 * item.fair.delta for item in decision.models}}
         if self.volatility_strategy.liquidating:
-            # Discard pending entry legs once the inventory exit deadline arrives.
             self.pending_volatility_trades.clear()
         if self.flatten_only:
             self.pending_volatility_trades = [DesiredTrade(symbol, -int(row["position"]), "flatten option")
@@ -169,10 +155,6 @@ class Bot:
                           and not self.flatten_only and not pending_exit)
         forced_option_exit = decision.reason.startswith("exit:") and any(item.quote.position for item in decision.models)
         if forced_option_exit and not pending_exit:
-            # Exit plans can cover hundreds of contracts. Submit only one
-            # legal child at a time. Queue alternating legs so normal delta
-            # hedges cannot split a pair into directional inventory while the
-            # serial exit is in progress.
             self.pending_volatility_trades.clear()
             remaining = [(item.quote.symbol, -int(item.quote.position))
                          for item in decision.models if item.quote.position]
@@ -195,8 +177,6 @@ class Bot:
                 return {"wait": "option exit lacks a legal child order", "decision": decision_fields}
             trade = self.pending_volatility_trades.pop(0)
         elif priority_hedge:
-            # Only the 6,000-delta safety hedge may interrupt a queued pair.
-            # Ordinary band hedges wait until both straddle legs are confirmed.
             trade = decision.desired_trades[0]
         else:
             if self.pending_volatility_trades and self.pending_volatility_trades[0].reason == "ATM volatility straddle":
@@ -207,8 +187,6 @@ class Bot:
                 valid = any(item.symbol == pending.symbol and item.side == side for item in opportunities)
                 if not valid or decision.reason.startswith("exit:"):
                     self.pending_volatility_trades.clear()
-                    # The pair's thesis no longer supports completing the second
-                    # leg. Explicitly unwind the confirmed first leg instead.
                     self.pending_volatility_trades.extend(
                         DesiredTrade(item.quote.symbol, -item.quote.position, "aborted straddle unwind")
                         for item in decision.models if item.quote.position)
@@ -223,8 +201,6 @@ class Bot:
         try:
             action = self.submit(snapshot, trade.symbol, trade.quantity, reason, deltas)
         except risk.RiskError as error:
-            # All RiskError gates run before Executor.order: no mutation occurred.
-            # Discard dependent legs and let the next fresh decision hedge or exit.
             self.pending_volatility_trades.clear()
             rejection = {"symbol": trade.symbol, "quantity": trade.quantity,
                          "reason": str(error), "submitted": False}
@@ -245,7 +221,6 @@ class Bot:
                 continue
             ticker = row["ticker"]
             q = 10 if row["signal"] == "BUY" else -10
-            # Small MVP inventory caps, stricter than case limits.
             if abs(securities[ticker]["position"] + q) > 50 or analysis["option_gross"] + abs(q) > 200:
                 continue
             projected_delta = analysis["portfolio_delta_shares"] + q*deltas[ticker]
@@ -257,49 +232,77 @@ class Bot:
                 continue
         return None
 
+    @staticmethod
+    def _basket_liquidation_budget(snapshot: Mapping[str, Any], positions: Mapping[str, float]) -> dict[str, int]:
+        """Reserve enough late-round time to flatten basket equities and net USD."""
+        securities = {row["ticker"]: row for row in snapshot["securities"]}
+        actions = 0
+        for ticker in etf.WEIGHTS:
+            position = abs(int(positions.get(ticker, 0)))
+            if not position:
+                continue
+            cap = min(ETF_UNWIND_MAX_CHILD, int(securities[ticker].get("max_trade_size", 0)))
+            if cap <= 0:
+                return {"actions": 300, "reserve_ticks": 300, "latest_start_tick": 0}
+            actions += math.ceil(position / cap)
+        if actions:
+            actions += 1  # final net-USD conversion after all equities are flat
+        reserve = actions * ETF_TENDER_TICKS_PER_ACTION + ETF_TENDER_LIQUIDATION_BUFFER_TICKS
+        return {"actions": actions, "reserve_ticks": reserve,
+                "latest_start_tick": max(0, 298 - reserve)}
+
     def etf_step(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
-        """Manage natural USD financing, inventory, tenders, then new baskets."""
+        """Manage tracked baskets, inventory, final USD, tenders, then new baskets."""
         positions = {s["ticker"]: s["position"] for s in snapshot["securities"]}
-        closing = self.flatten_only or snapshot["case"]["tick"] >= 250
+        tick = snapshot["case"]["tick"]
         analysis = etf.analyze(snapshot, self.quantity, self.gross_limit, self.net_limit)
-        if self.held_basket and not closing:
-            expected, direction = self.held_basket
+
+        if self.held_basket:
+            expected = self.held_basket["expected_positions"]
             if all(positions[t] == p for t, p in expected.items()):
-                opportunity = analysis["opportunities"][0 if direction == 1 else 1]
-                if opportunity.get("edge_cad_per_unit", -1) > 0:
-                    return {"wait": "hold basket for convergence"}
-            self.held_basket = None
+                budget = self._basket_liquidation_budget(snapshot, positions)
+                forced = self.flatten_only or tick >= budget["latest_start_tick"]
+                try:
+                    close = etf.basket_close_now(snapshot, self.held_basket)
+                except (ValueError, KeyError) as error:
+                    if not forced:
+                        return {"wait": f"basket close cannot be priced: {error}",
+                                "liquidation_budget": budget}
+                    close = {"pnl_cad": None, "pricing_error": str(error)}
+                if not forced and close["pnl_cad"] <= 0:
+                    return {"wait": "hold basket; executable close-now P&L is not positive",
+                            "basket_close": close, "liquidation_budget": budget}
+                self.held_basket = None
+            else:
+                self.held_basket = None
+
         recommended_converter = next((item for item in analysis.get("manual_converters", [])
                                       if item.get("recommended")), None)
         if recommended_converter:
             return {"wait": f"manual {recommended_converter['converter']} recommended",
                     "manual_converter": recommended_converter}
-        # A tender, a restarted bot, or an exit is unwound one child at a time.
         if any(positions[t] for t in etf.WEIGHTS):
             return self.unwind_etf(snapshot, positions)
-        # RITC and the USD cash it creates naturally offset while inventory is
-        # worked. Convert only the final net USD balance after equities are flat.
         usd = positions.get("USD", 0)
         if abs(usd) >= 1:
-            return self.submit(snapshot, "USD", -clip(usd, 2500000), "hedge net USD cash")
+            # USD orders are whole units. Round the final cash balance to the
+            # nearest legal unit instead of truncating and systematically
+            # leaving almost C$1 of residual currency exposure.
+            fx_quantity = -int(math.copysign(min(round(abs(usd)), 2_500_000), usd))
+            return self.submit(snapshot, "USD", fx_quantity, "hedge net USD cash")
         tender_action = self.choose_tender(snapshot, positions, analysis)
         if tender_action:
             return tender_action
-        if closing:
+        if self.flatten_only:
             return {"wait": "flat"}
+        if tick >= ETF_BASKET_LAST_ENTRY_TICK:
+            return {"wait": "no new basket late in round"}
         if self.basket:
             return self.enter_basket(snapshot, positions, analysis) or {"wait": "no eligible basket"}
         return {"wait": "no eligible ETF trade"}
 
     def unwind_etf(self, snapshot: Mapping[str, Any], positions: Mapping[str, float]) -> dict[str, Any]:
-        """Reduce the largest weighted holding in a depth-supported child.
-
-        ETF risk is greatest while an unpaired holding remains. Use up to the
-        venue's 10,000-share stock-order limit rather than the smaller basket
-        entry size, while requiring all shares of the selected child to be
-        executable against displayed depth.
-        """
-
+        """Reduce the largest weighted holding in a depth-supported child."""
         securities = {str(item["ticker"]): item for item in snapshot["securities"]}
         for ticker in sorted(etf.WEIGHTS, key=lambda t: abs(positions[t])*etf.WEIGHTS[t], reverse=True):
             if not positions[ticker]:
@@ -323,12 +326,7 @@ class Bot:
 
     def choose_tender(self, snapshot: Mapping[str, Any], positions: Mapping[str, float],
                       analysis: Mapping[str, Any]) -> dict[str, Any] | None:
-        """Accept one fixed RITC tender only while existing equity inventory is flat.
-
-        Full visible unwind depth is required for the complete tender. A
-        0.25-cent/share cushion remains for price movement and serial fills;
-        the server and local weighted-risk checks bound tender size.
-        """
+        """Accept one fixed RITC tender only when its stressed liquidation remains attractive."""
         assessments = self.tender_assessments(snapshot, positions, analysis)
         for assessment in assessments:
             if assessment["decision"] != "ACCEPT":
@@ -352,8 +350,7 @@ class Bot:
                 if refreshed is None:
                     rejected = dict(assessment)
                     rejected.update(decision="REJECT", reason="tender disappeared before acceptance")
-                    return {"wait": "tender disappeared before acceptance",
-                            "tender_assessment": rejected}
+                    return {"wait": "tender disappeared before acceptance", "tender_assessment": rejected}
                 if refreshed["decision"] != "ACCEPT":
                     return {"wait": f"fresh tender rejected: {refreshed['reason']}",
                             "tender_assessment": refreshed}
@@ -367,7 +364,6 @@ class Bot:
     @staticmethod
     def _tender_liquidation_budget(snapshot: Mapping[str, Any], quantity: int) -> dict[str, int]:
         """Reserve time for legal RITC children and one final net FX hedge."""
-
         securities = {row["ticker"]: row for row in snapshot["securities"]}
         ritc_cap = min(ETF_UNWIND_MAX_CHILD, int(securities["RITC"].get("max_trade_size", 0)))
         fx_cap = int(securities["USD"].get("max_trade_size", 0))
@@ -380,21 +376,14 @@ class Bot:
 
     def tender_assessments(self, snapshot: Mapping[str, Any], positions: Mapping[str, float],
                            analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Explain accept/reject decisions for every visible ETF tender.
-
-        The output is deliberately suitable for the operator console: it
-        preserves the full-depth estimate and names the first binding gate,
-        including inventory priority and server-weighted risk rejection.
-        """
-
+        """Explain accept/reject decisions for every visible ETF tender."""
         reports = {item["tender_id"]: item for item in analysis.get("tenders", [])}
         existing_inventory = any(positions.get(ticker, 0) for ticker in etf.WEIGHTS)
         assessments: list[dict[str, Any]] = []
         for offer in snapshot.get("tenders", []):
             quantity = offer.get("quantity")
             report = reports.get(offer.get("tender_id"), {})
-            minimum = (ETF_TENDER_MIN_UNWIND_PROFIT_PER_UNIT_CAD * quantity
-                       if isinstance(quantity, (int, float)) else None)
+            reserve = report.get("liquidation_reserve_cad")
             budget = (self._tender_liquidation_budget(snapshot, int(quantity))
                       if isinstance(quantity, (int, float)) and quantity > 0 and int(quantity) == quantity else None)
             assessment = {"offer": offer, "tender_id": offer.get("tender_id"),
@@ -402,7 +391,8 @@ class Bot:
                           "price": offer.get("price"), "expires": offer.get("expires"),
                           "estimated_unwind_profit_usd": report.get("estimated_unwind_profit_usd"),
                           "estimated_unwind_profit_cad": report.get("estimated_unwind_profit_cad"),
-                          "minimum_profit_cad": minimum,
+                          "minimum_profit_cad": reserve,
+                          "liquidation_reserve": report.get("liquidation_reserve"),
                           "liquidation_budget": budget}
             if offer.get("ticker") != "RITC" or not offer.get("is_fixed_bid"):
                 assessment.update(decision="REJECT", reason="only fixed-price RITC tenders are supported")
@@ -412,19 +402,17 @@ class Bot:
                 assessment.update(decision="REJECT", reason="new tender exposure is disabled in flatten-only mode")
             elif existing_inventory:
                 assessment.update(decision="DEFER", reason="existing ETF inventory must be reduced first")
-            # Tender expiry limits when the offer may be accepted; it does not
-            # require the resulting inventory to be liquidated by that tick.
-            # A visible offer remains eligible right up to its expiry. The
-            # fresh preflight below is authoritative if it disappears while
-            # the decision is being made.
             elif isinstance(offer.get("expires"), (int, float)) and offer["expires"] < snapshot["case"]["tick"]:
                 assessment.update(decision="REJECT", reason="tender offer is already expired")
             elif offer.get("action") not in ("BUY", "SELL") or not isinstance(quantity, (int, float)) or int(quantity) != quantity:
                 assessment.update(decision="REJECT", reason="tender action or quantity is invalid")
             elif snapshot["case"]["tick"] > budget["latest_accept_tick"]:
                 assessment.update(decision="REJECT", reason="insufficient time for a full child-order liquidation")
-            elif report.get("estimated_unwind_profit_cad", float("-inf")) < minimum:
-                assessment.update(decision="REJECT", reason="FX-adjusted unwind edge is below the C$0.0025/share buffer")
+            elif reserve is None:
+                assessment.update(decision="REJECT", reason="size-aware liquidation reserve is unavailable")
+            elif report.get("estimated_unwind_profit_cad", float("-inf")) < reserve:
+                assessment.update(decision="REJECT",
+                                  reason="FX-adjusted unwind edge is below the size-aware liquidation/slippage reserve")
             else:
                 q = int(quantity) * (1 if offer["action"] == "BUY" else -1)
                 try:
@@ -433,41 +421,68 @@ class Bot:
                 except risk.RiskError as error:
                     assessment.update(decision="REJECT", reason=f"risk gate: {error}")
                 else:
-                    assessment.update(decision="ACCEPT", reason="full-depth unwind edge clears buffer and risk gates")
+                    assessment.update(decision="ACCEPT",
+                                      reason="full-depth unwind edge clears size-aware reserve and risk gates")
             assessments.append(assessment)
         return assessments
 
+    def _abort_basket(self, base_positions: Mapping[str, float], entry_fills: list[Mapping[str, Any]]) -> None:
+        """Reverse confirmed basket legs in reverse fill order after repricing says abort."""
+        expected = {ticker: float(base_positions[ticker]) for ticker in etf.WEIGHTS}
+        for fill in entry_fills:
+            expected[fill["ticker"]] += int(fill["quantity"])
+        for fill in reversed(entry_fills):
+            fresh = self.client.snapshot("etf", trading=True)
+            actual = {s["ticker"]: s["position"] for s in fresh["securities"]}
+            if any(actual[t] != expected[t] for t in etf.WEIGHTS):
+                raise RuntimeError("Basket abort inventory mismatch; stop and reconcile")
+            ticker, quantity = fill["ticker"], -int(fill["quantity"])
+            self.submit(fresh, ticker, quantity, "abort basket after serial repricing")
+            expected[ticker] += quantity
+
     def enter_basket(self, snapshot: Mapping[str, Any], positions: Mapping[str, float],
                      analysis: Mapping[str, Any]) -> dict[str, Any] | None:
-        """Execute optional basket legs serially, checking inventory between legs.
-
-        Exchange legs are NOT atomic. A failure propagates out of the runner;
-        do not catch it and submit a replacement basket. Restart into inventory
-        reduction after reconciling the interrupted journal.
-        """
+        """Execute serial basket legs with a fresh finish-versus-abort check after every fill."""
         for opportunity in analysis["opportunities"]:
-            # The model prices all visible depth, commissions, and the USD
-            # conversion.  It still reserves an explicit buffer because legs
-            # fill serially and no converter makes this atomic.
             if (not opportunity.get("eligible_after_buffer")
                     or not opportunity.get("within_configured_limits")):
                 continue
             legs = opportunity["legs"]
             if not self.executor:
                 return {"basket": legs, "reason": "basket mispricing"}
+            entry_fills: list[dict[str, Any]] = []
             for index, (ticker, q) in enumerate(legs):
                 fresh = snapshot if index == 0 else self.client.snapshot("etf", trading=True)
-                # Confirm actual inventory after the previous fully filled child order.
                 actual = {s["ticker"]: s["position"] for s in fresh["securities"]}
                 expected = dict(positions)
-                for prior_ticker, prior_q in legs[:index]:
-                    expected[prior_ticker] += prior_q
+                for prior in entry_fills:
+                    expected[prior["ticker"]] += int(prior["quantity"])
                 if any(actual[t] != expected[t] for t in etf.WEIGHTS):
                     raise RuntimeError("Basket inventory mismatch; stop and reconcile")
-                self.submit(fresh, ticker, q, "basket leg")
+                side = "BUY" if q > 0 else "SELL"
+                quoted_price = etf.vwap(fresh["books"][ticker], side, abs(q))
+                action = self.submit(fresh, ticker, q, "basket leg")
+                fill_price = _fill_price(action.get("fill"), quoted_price)
+                entry_fills.append({"ticker": ticker, "quantity": q, "price": fill_price,
+                                    "cashflow": etf.trade_cashflow(ticker, q, fill_price)})
+                if index < len(legs) - 1:
+                    repriced = self.client.snapshot("etf", trading=True)
+                    after = {s["ticker"]: s["position"] for s in repriced["securities"]}
+                    expected[ticker] += q
+                    if any(after[t] != expected[t] for t in etf.WEIGHTS):
+                        raise RuntimeError("Basket inventory mismatch after fill; stop and reconcile")
+                    choice = etf.serial_basket_choice(repriced, entry_fills, legs[index + 1:])
+                    if not choice["finish"]:
+                        self._abort_basket(positions, entry_fills)
+                        return {"basket": legs[:index + 1], "reason": "basket aborted after serial repricing",
+                                "aborted": True, "serial_reprice": choice}
             expected = {t: positions[t] for t in etf.WEIGHTS}
             for ticker, q in legs:
                 expected[ticker] += q
-            self.held_basket = (expected, 1 if legs[-1][1] > 0 else -1)
-            return {"basket": legs, "reason": "basket filled"}
+            self.held_basket = {"expected_positions": expected,
+                                "direction": 1 if legs[-1][1] > 0 else -1,
+                                "entry_fills": entry_fills,
+                                "entry_cashflows": etf.cashflow_totals(entry_fills),
+                                "entry_tick": snapshot["case"]["tick"]}
+            return {"basket": legs, "reason": "basket filled", "entry_fills": entry_fills}
         return None
