@@ -43,7 +43,7 @@ python3 run.py etf --source api --plan --watch --gross-limit 300000 --net-limit 
 python3 run.py etf --source api --trade --watch --gross-limit 300000 --net-limit 200000
 ```
 
-ETF mode starts with tenders and inventory reduction. Add `--basket` to enable three-leg statistical arbitrage. `--quantity` controls basket-entry child size (default 1,000; maximum 10,000); inventory reduction uses depth-supported children up to the venue's 10,000-share cap. Every visible tender prints a high-visibility CLI alert with its offer terms, executable unwind estimate, decision, and binding reason. When a manual ETF Creation or Redemption is economically preferred, the bot pauses automated unwinding and prints a boxed `MANUAL WIND/UNWIND REQUIRED` instruction.
+ETF mode evaluates tenders against the current portfolio, including tenders that offset existing inventory. Add `--basket` to enable three-leg convergence entries. `--quantity` is the target shares **per basket leg** (default 1,000), while `--child-size` caps each equity order (default and maximum 10,000, further bounded by the venue). A larger basket is built in balanced three-leg slices with fresh quotes and intermediate risk checks. Capacity or deteriorating prices can shrink a slice or stop the build below target. Every tender prints its route, profit, separate execution/FX reserves, decision and binding reason. API bot mode also appends these decisions to `data/etf-decisions.jsonl` unless `--decision-log` selects another file. The console keeps ordinary actions compact; `--verbose` prints the full route calculations as well.
 
 Without `--watch`, only one decision is made. With `--watch`, the process polls until Ctrl+C, including through stopped sessions. Ctrl+C stops further submissions; it does not flatten holdings or cancel an order that may already have reached the server. A process lock prevents two instances from using the same journal; run only one bot per account and do not bypass this with alternate journal paths.
 
@@ -73,6 +73,16 @@ python3 scripts/supervise_volatility.py --case etf \
   --gross-limit 300000 --net-limit 200000 --basket
 ```
 
+For an authorized trading heat with a 20,000-share target per basket leg,
+10,000-share children, and the aggressive default uncertainty coefficients:
+
+```sh
+python3 scripts/supervise_volatility.py --case etf --trade --basket \
+  --gross-limit 300000 --net-limit 200000 --quantity 20000 --child-size 10000 \
+  --execution-risk-k 0.25 --fx-risk-k 0.5 --manual-wait-ticks 8 \
+  --decision-log data/etf-decisions.jsonl --record data/etf-snapshots.jsonl
+```
+
 The supervisor does not restart a worker that exits with an API, execution, or
 risk error. Inspect `--check`, resolve open orders, and run `--reconcile` before
 starting it again. This prevents a market reset from disguising an ambiguous
@@ -87,7 +97,9 @@ current worker.
 4. `risk.check` verifies order size, tradeability, local projected risk, and projected server limits using security limit bindings. Existing open orders block new ones.
 5. `Executor` persists an intent, submits once, and polls the returned order ID. Only a complete terminal fill allows the next action.
 
-Snapshots are not atomic. Volatility click trading can change the account while the bot runs; the worker waits for open orders and replans from confirmed inventory. ETF execution still requires exclusive account use. Market orders can execute away from observed quotes; conservative thresholds reduce this risk but cannot eliminate it.
+Snapshots are not atomic. Both cases refresh account state before order submission and replan if positions or open orders changed. ETF additionally checks session continuity and refreshed cash/stock limits; a drift during a partial basket latches reduction. ETF execution still requires exclusive account use because the final check and exchange mutation cannot be atomic. Market orders can execute away from observed quotes; thresholds reduce this risk but cannot eliminate it.
+
+A known open account order makes the ETF worker wait without submitting or cancelling orders. When it clears, the worker rechecks confirmed inventory; an interrupted held basket stays latched for reduction. This wait does not clear an ambiguous/partial execution halt. Older workers that already latched the former `Existing open orders must be reconciled` error need to be stopped and restarted after checking/reconciling the account.
 
 ## Volatility decisions and units
 
@@ -101,16 +113,52 @@ Snapshots are not atomic. Volatility click trading can change the account while 
 ## ETF decisions and units
 
 - Keep RITC and its naturally offsetting USD cash together while equity inventory is worked. Convert only the final net USD balance after the equity position is flat; this avoids paying an unnecessary gross FX round trip.
-- Before direct liquidation, compare eligible 10,000-unit manual converter blocks with executable direct-unwind prices. ETF Redemption consumes 10,000 RITC and produces 10,000 BULL plus 10,000 BEAR; ETF Creation does the inverse. Each use costs USD 1,500. The API cannot invoke converters, so a preferred route pauses the bot and loudly directs the operator to use the RIT Client Assets tab.
+- Before tender acceptance, compare direct liquidation, manual conversion and mixed routes from the resulting portfolio. ETF Redemption consumes 10,000 RITC and produces 10,000 BULL plus 10,000 BEAR; ETF Creation does the inverse. Each use costs USD 1,500. Creation routes may buy missing BULL/BEAR in legal children before the operator uses the converter; every intermediate stage must fit stock and cash limits. Route value is incremental versus liquidating the current inventory, allowing profitable exposure-reducing tenders.
+- A preferred manual route prints `MANUAL WIND/UNWIND REQUIRED` and a deadline. The default wait is eight ticks after preparation, subject to enough remaining time for liquidation. After timeout, direct reduction stays latched until flat. Forced end-of-round or `--flatten-only` liquidation always overrides manual waiting. Set `--manual-wait-ticks 0` to disable manual routes, including converter-dependent tender acceptance. If a manual action is missed or markets move, the direct fallback can realize a loss.
 - Otherwise unwind existing equity inventory one child at a time, selecting a risk-legal order with enough visible depth. On restart, existing baskets are treated as inventory to close.
-- Accept only fixed-price RITC tenders with sufficient visible full-size unwind depth, projected risk capacity, a C$0.0025/share cushion after converting the final net USD result, and enough time before the 300-tick case end for legal child orders plus the final FX conversion. Tender expiry is only the acceptance deadline: a still-visible offer is eligible until that deadline, and a fresh full snapshot must still contain and approve it immediately before submission.
-- Optional baskets enter only while equity inventory is flat and the executable CAD edge clears a 0.10/unit serial-execution reserve. The signal crosses BULL/BEAR/RITC/USD visible depth and includes all three equity fees. Indicative USD is rounded up for a purchase after its fee and down for sale proceeds after its fee. Each leg must fully fill; inventory is reread before the next. Hold until the entry-direction edge disappears, unwind equities, then convert final net USD. Converters remain human-operated.
-- From tick 250, take no new baskets. A tender can still qualify after tick 250 only when its size-aware liquidation budget fits before case end. Gross risk counts RITC twice. Server `limits[].units` expresses instrument units per risk unit: a binding of 0.5 means a reciprocal weight of 2.
-- A basket is a statistical convergence trade with sequential execution. Partial legs create directional exposure, and any failure stops the runner for reconciliation. Tender estimates are static depth calculations, not promises about the eventual unwind.
+- Accept only fixed-price RITC tenders whose selected route clears the larger of C$0.0025/share or the execution-plus-FX uncertainty reserve. Frozen-book routes consume each displayed level once. Direct RITC depth is not required when a complete legal converter route supplies an exit. Staged direct routes have additional evidence and stress-exit checks below. Every route must fit before case end, with legal child sizes, final FX children, a manual allowance where needed, and a five-tick end buffer. Tender expiry is only the acceptance deadline; a fresh full snapshot must still contain and approve the offer before submission.
+- `DIRECT_STAGED` is enabled by default for tenders taken from an equity-flat account. It requires at least four past arrival intervals spanning 12 ticks. Only previously unseen RITC order IDs created since the previous observation and within US$0.05 of the current touch count. Pace children at no more than 50% of the lower-quartile observed arrival rate. Repeated snapshots and old displayed orders do not count as replenishment; history resets each heat and evidence older than two ticks is unavailable. Missing order IDs/timestamps disable this forecast, not ordinary frozen-book trading.
+- Staged pricing gives only 50% credit for recovery from depleted-book VWAP toward current child VWAP, with an additional US$0.05 adverse-price allowance on the refreshed reference. This is a forecast, not certain liquidity. The full frozen-book direct exit must remain priceable and its modeled loss must not exceed `--tender-max-fallback-loss 0.15` CAD/share. The schedule must fit `--tender-max-unwind-ticks 60` and the case deadline; all forecast AND fallback cash/stock stages are checked. `--no-staged-tenders` disables the model. Both runner and supervisor accept these controls.
+- After a staged acceptance, new tenders and conversions are deferred. Submit one confirmed child per slot only when fresh depth meets its forecast price bound. Wait at most six additional ticks for a missed slot, never past the route deadline. Lost fallback depth, changed inventory, the loss trigger, or a missed deadline latches direct liquidation through final USD. No mutation is retried. The loss trigger is **not** a guaranteed maximum realized loss: quotes can gap and market orders can slip. Console alerts explicitly label staged forecasts and show frozen-book fallback P&L.
+- Execution reserve in CAD is `k_exec × sum(abs(child shares) × sigma_price × sqrt(time to child fill) × currency conversion)`. FX reserve is `k_fx × abs(final net USD) × sigma_FX × sqrt(route horizon)`. Price sigmas are trailing RMS midpoint changes per square root of tick, using up to 30 past intervals from the current heat. Startup uses a quarter-spread proxy and explicit floors (0.005 equity quote-currency dollars and 0.0001 CAD/USD per square root of tick). Three ticks per action is the initial scheduling assumption. Spread, depth and commissions are already in route cashflows and are not charged again as uncertainty.
+- Basket coefficients remain `--execution-risk-k 0.25 --fx-risk-k 0.5`. Tender reserves use independent `--tender-execution-risk-k 0.15 --tender-fx-risk-k 0.25` defaults in both runner and supervisor. These are risk preferences, not statistical guarantees. The September 17 logged heat (ticks 82–298) contained six distinct tenders; five never showed a positive executable route, while tender 3131 at tick 203 showed a three-block redemption profit of C$8,530.32 against the former C$10,192.46 reserve. The revised weights reduce that route's allowance to C$5,602.28. This is a counterfactual eligibility calculation on recorded decisions, not a simulated fill or realized-P&L backtest. The route still requires manual conversion and all existing risk/time checks.
+- There is no fixed initial cash reserve. Each route recomputes its CAD profit hurdle from quantity, quote spreads, serial fill times, and observed volatility. At worker startup the history is empty: equity sigma is `max(0.005, spread/4)` and FX sigma is 0.0001 CAD/USD/sqrt(tick), replaced by trailing observed RMS with the same floors. For a direct RITC unwind at FX midpoint 1, a two-cent equity spread and near-flat final USD, the new startup hurdle is about C$25 for 10,000 shares (the minimum-profit floor binds), and C$292 for 100,000 shares in ten children. Wider spreads or observed price movement raise it. Decision reserve details identify whether startup or observed volatility supplied each sigma. Restarting a worker resets this history; it is not a way to recalibrate risk.
+- `--basket` explicitly enables **capped convergence positions**, including sizes smaller than a converter block. These are not locked arbitrages. The configured basket target is bounded by `--basket-max-quantity` (default 20,000 shares per leg), legal child caps, current depth and intermediate risk. No minimum 10,000-unit position is forced simply to qualify for a manual converter. A feasible, cheaper manual route can still be recommended for eligible whole blocks; automated converters remain unsupported.
+- Basket entry records both immediate executable liquidation P&L and a **conditional** payoff if the parity gap closes. It requires the latter to cover modeled exit spreads/depth, exit commissions, entry/exit execution reserves, FX uncertainty and C$0.02/share profit (or the take-profit target when larger). The former extra C$0.10/share hurdle is removed. Exit friction is measured against the top-of-book midpoint, preserving depth costs. FX uncertainty in establishing the entry reference and on the final net USD is explicit; no gross USD round trip is submitted. Reject an entry whose immediate liquidation loss already meets/exceeds its loss budget. These assumptions are not a forecast that convergence will occur.
+- Basket execution uncertainty now uses scheduled cashflow variance: for each action interval, square the remaining aggregate quantity of each ticker times its CAD price sigma, sum across tickers, and multiply by interval length. Take the square root of total variance and multiply by `k_exec`. Children of the same ticker are correlated through their shared remaining exposure; splitting cannot create fake diversification. Entry and exit have separate execution clocks. Combine execution phases by root-sum-square, combine FX phases similarly, then add the execution and FX allowances. Independent instruments/tick increments are explicit approximations, not calibrated covariance estimates or confidence bounds. Holding/convergence risk remains controlled by the separate loss, age and size rules; this execution reserve does not guarantee convergence.
+- Value the held basket before any addition or tender. Never add while executable basket P&L is negative; exits take precedence over additions. Historical fill cashflows and the **original** entry tick survive successful additions. Default exit triggers: executable profit above C$0.02/share plus exit uncertainty reserve, executable loss of C$0.30/share, 60 ticks since the first entry, a parity gap that has converged/reversed, or the inventory-dependent liquidation deadline. Profit can be taken immediately. A reversed gap exits even if past costs leave the position slightly negative; do not wait just to recover sunk costs. The loss threshold initiates market liquidation and is not a guaranteed fill price or maximum realized loss.
+- Basket controls are `--basket-max-hold-ticks 60`, `--basket-min-hold-ticks 10`, `--basket-take-profit 0.02`, `--basket-stop-loss 0.30`, `--basket-max-quantity 20000`, and `--basket-cooldown-ticks 5`; the runner and supervisor both accept them. CAD thresholds are per basket unit (one share of each equity), not per individual leg. Minimum hold ticks reserve an opportunity window **before entry**, not a prohibition on early profit-taking. A new slice must fit entry actions, that opportunity window, all projected liquidation children and the end buffer; there is no fixed tick-250 cutoff. Additions must also fit inside the original basket's remaining age limit.
+- After each confirmed serial fill, price completion again using the next leg's fresh snapshot. Compare the buffered **conditional** completion value with the executable abort loss, permit negative completion value only inside the configured loss budget, and bound the immediate full-basket liquidation loss too. Remaining-leg execution uncertainty and price risk on already-filled partial inventory are separate allowances. This is a risk-taking decision, not a claim that a conditional value is guaranteed cash. A vanished book, expired preflight or read failure after confirmed fills latches direct inventory reduction; incomplete/ambiguous mutations still halt for reconciliation. Never send remaining entry or abort legs after observing a session boundary. An aborted addition triggers reduction of the existing basket as well.
+- Stops, timeouts, inventory/FX mismatches and partial-entry recovery stay latched through final net USD liquidation, deferring tenders and manual conversions until flat. A five-tick cooldown follows completed reduction. Manual preparation also defers new tenders. On restart, basis is not reconstructed automatically from a mutation journal: existing positions are handled as inventory, never silently adopted as a newly opened convergence basket.
+- ETF decision logs include pre-action account positions and the server's per-security realized/unrealized P&L in their reported native currency. Missing fields remain null; cross-currency amounts are not summed into a fabricated account P&L. Basket records include entry basis, conditional and executable values, uncertainty reserves, holding age and exit cause; the compact CLI prints held P&L and exit reasons. Use `--record` as well to retain raw books for a full replay.
+
+Offline tender eligibility comparison (no API calls, fills or realized-P&L simulation):
+
+```sh
+python3 -m analysis.etf_audit data/etf-snapshots.jsonl --flat --no-staged-tenders
+python3 -m analysis.etf_audit data/etf-snapshots.jsonl --flat
+```
+
+The local September 17 audit of 1,605 recorded snapshots and 94 distinct offers
+found 9 eligible offers with frozen-book routes and 10 with staged routes.
+`--flat` is a counterfactual account assumption; these counts do not show that
+the strategy would have filled those offers or earned a profit. Most recorded
+offers still failed economic/risk gates. New model code is loaded by the next
+worker, not by an already running worker.
+- A tender can qualify late only when its size-aware liquidation budget fits before case end. Gross risk counts RITC twice. Server `limits[].units` expresses instrument units per risk unit: a binding of 0.5 means a reciprocal weight of 2. Tender estimates are static depth calculations, not promises about the eventual unwind.
 
 ## Failure and recovery
 
-Execution journals default to `data/<case>-<username>-execution.jsonl`. Entries are flushed to disk before requests. No password is recorded. An HTTP error, timeout, malformed response, partial fill, or unconfirmed cancellation stops execution. POST/DELETE are never automatically retried.
+Execution journals default to `data/<case>-<username>-execution.jsonl`. Entries are flushed to disk before requests. No password is recorded. A mutation failure, partial fill, or read failure while confirming an outstanding mutation stops execution. ETF read failures or known risk rejections before submission replan from fresh inventory; confirmed partial basket sequences become inventory to manage. POST/DELETE are never automatically retried.
+
+Tender acceptance can be acknowledged before the securities endpoint reflects
+its inventory effect. The executor submits exactly once, then checks up to 12
+times, separated by 0.25 seconds (plus API latency). Only an unchanged
+pre-tender position is allowed to wait. A partial/unexpected position, session
+change, read failure or timeout keeps the journal unresolved and halts. The
+journal records the offer, expected position, acknowledgement and confirmation
+outcome. This fixes the old single-read false halt; it does **not** automatically
+clear journals left by an older worker or retry their acceptance requests.
 
 1. Stop any other process using the account. Inspect `--check` and the last journal events.
 2. Resolve any open orders. Use the API/client as permitted by the session rules; automated trading cases may prohibit manual orders. Preserve the journal for review.
@@ -128,6 +176,15 @@ python3 run.py volatility --plan --sigma 0.25
 ```
 
 Tests exercise pricing identities, actual news formats, inverse risk-unit weights, tender unwinds, partial/uncertain fills, and a mocked 300-tick volatility round. The mock verifies behavior, not market realism or profitability. Local recordings are ignored by Git. Replay recalculates signals; it is not a fills/P&L backtester.
+
+Audit ETF eligibility without contacting the server:
+
+```sh
+python3 -m analysis.etf_audit data/etf-snapshots.jsonl --flat --limit 1005
+```
+
+Omit `--flat` to retain recorded account inventory and server counters. Both
+modes use only earlier quotes for the risk estimates. No fills are simulated.
 
 ### Adaptive volatility deadlines
 

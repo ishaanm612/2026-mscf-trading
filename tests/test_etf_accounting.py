@@ -152,10 +152,13 @@ class ETFAccounting(unittest.TestCase):
         large_offer = {**small_offer, "tender_id": 2, "quantity": 50_000}
         small_report = etf.tender_opportunity(small, small_offer)
         large_report = etf.tender_opportunity(large, large_offer)
-        self.assertGreater(small_report["liquidation_reserve_cad"], 2.50)
+        # At the reduced tender weights a tiny calm-market route binds on
+        # the profit floor; larger multi-child routes still need more reserve.
+        self.assertEqual(small_report["liquidation_reserve_cad"], 2.50)
         self.assertGreater(large_report["liquidation_reserve_cad"],
                            50 * small_report["liquidation_reserve_cad"])
-        self.assertEqual(large_report["liquidation_reserve"]["child_orders"], 5)
+        direct = next(row for row in large_report["routes"] if row["name"] == "DIRECT")
+        self.assertEqual(direct["reserve"]["child_orders"], 5)
 
     def test_converter_uses_resulting_net_usd_and_optimizes_block_count(self):
         snapshot = etf_snapshot()
@@ -224,6 +227,12 @@ class ETFAccounting(unittest.TestCase):
 
     def test_serial_basket_reprices_and_reverses_after_bad_first_fill(self):
         exchange = ETFExchange()
+        # C$0.50+ parity gap is large enough to clear entry, exit and serial
+        # risk reserves before the first leg is filled.
+        exchange.state["books"]["RITC"] = {
+            "bids": [{"price": 24.39, "quantity": 1_000_000}],
+            "asks": [{"price": 24.40, "quantity": 1_000_000}],
+        }
         def shock(ex: ETFExchange, count: int) -> None:
             if count == 1:
                 ex.state["books"]["BEAR"]["bids"] = [{"price": 10.0, "quantity": 1_000_000}]
@@ -237,8 +246,13 @@ class ETFAccounting(unittest.TestCase):
         self.assertTrue(exchange.is_flat())
         self.assertLess(exchange.realized_pnl_cad, 0)  # one spread + commissions paid to escape
 
-    def test_existing_basket_holds_at_250_and_exits_on_positive_close_now_pnl(self):
+    def test_existing_basket_holds_through_tick_250_and_exits_on_positive_close_now_pnl(self):
         exchange = ETFExchange()
+        exchange.state["books"]["RITC"] = {
+            "bids": [{"price": 24.39, "quantity": 1_000_000}],
+            "asks": [{"price": 24.40, "quantity": 1_000_000}],
+        }
+        exchange.state["case"]["tick"] = 230
         bot = Bot(exchange, exchange, case="etf", basket=True, quantity=1_000,
                   gross_limit=300_000, net_limit=200_000)
         entry = bot.step(exchange.snapshot())
@@ -246,7 +260,7 @@ class ETFAccounting(unittest.TestCase):
         self.assertNotIn("USD", [row["ticker"] for row in exchange.orders])
         exchange.state["case"]["tick"] = 250
         hold = bot.step(exchange.snapshot())
-        self.assertIn("close-now P&L is not positive", hold["wait"])
+        self.assertEqual(hold["wait"], "hold convergence basket")
         self.assertIsNotNone(bot.held_basket)
         # Convergence favorable to long RITC / short CAD basket.
         exchange.state["books"]["BULL"] = {"bids": [{"price": 9.80, "quantity": 1_000_000}],
@@ -265,13 +279,17 @@ class ETFAccounting(unittest.TestCase):
         self.assertTrue(exchange.is_flat())
         self.assertGreater(exchange.realized_pnl_cad, 0)
 
-    def test_new_basket_is_blocked_at_tick_250(self):
+    def test_new_basket_is_blocked_when_dynamic_window_cannot_fit_at_tick_285(self):
         exchange = ETFExchange()
-        exchange.state["case"]["tick"] = 250
+        exchange.state["books"]["RITC"] = {
+            "bids": [{"price": 24.39, "quantity": 1_000_000}],
+            "asks": [{"price": 24.40, "quantity": 1_000_000}],
+        }
+        exchange.state["case"]["tick"] = 285
         bot = Bot(exchange, exchange, case="etf", basket=True, quantity=1_000,
                   gross_limit=300_000, net_limit=200_000)
         result = bot.step(exchange.snapshot())
-        self.assertEqual(result["wait"], "no new basket late in round")
+        self.assertNotEqual(result.get("reason"), "basket filled")
         self.assertEqual(exchange.orders, [])
 
 

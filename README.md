@@ -24,6 +24,9 @@ execution.py          Serial orders, fill confirmation, recovery journal
 OPERATIONS.md        Trading commands, design notes, recovery
 models/
   etf.py             ETF arbitrage and tender analysis
+  etf_policy.py      Child schedules, portfolio tender routes, execution/FX reserves
+  etf_liquidity.py   Observed order arrivals and bounded staged tender forecasts
+  etf_basket.py      Capped convergence basket valuation, holding and exit policy
   volatility.py      Black-Scholes prices, Greeks, and implied volatility
   news.py            Weekly volatility announcement parser
   __init__.py        Model package
@@ -39,6 +42,7 @@ volatility/
 analysis/
   reaction.py        Offline SVG chart of market-IV convergence after news
   convergence.py     Train an opt-in executable-return convergence filter
+  etf_audit.py       Read-only tender eligibility replay (not a P&L backtest)
 dashboard/
   server.py          Local live GUI for explainable decision logs
 tests/               Model, execution, and full-round behavior tests
@@ -127,7 +131,9 @@ inspect account state and reconcile its journal before manually restarting.
 
 ## What is implemented
 
-- `models/etf.py`: remaining-depth VWAP, FX-adjusted basket comparisons with fees, weighted exposure and sequential hypothetical-fill checks, fixed-price tender unwind estimates, and manual converter comparisons. Supply `--gross-limit` and `--net-limit` from the actual session; otherwise risk eligibility is unknown (`null`).
+- `models/etf.py` and `models/etf_policy.py`: depth-aware cashflows, balanced basket slices, portfolio tender routes, manual converter comparisons, and separate execution/FX uncertainty reserves. Supply `--gross-limit` and `--net-limit` from the actual session. `--quantity` sets the basket target per leg; `--child-size` limits each equity order. ETF decisions default to `data/etf-decisions.jsonl` in API bot mode.
+- `models/etf_basket.py`: optional capped convergence baskets with entry/exit cost reserves, executable holding valuation, no underwater additions, dynamic entry deadlines, and latched exits. Defaults are a 20,000-unit cap, 60-tick maximum hold, C$0.02/unit profit target plus exit reserve, and C$0.30/unit loss trigger; see `OPERATIONS.md` for flags and assumptions.
+- Tender risk weights are independent: `--tender-execution-risk-k 0.15 --tender-fx-risk-k 0.25` defaults apply to tender liquidation routes; `--execution-risk-k` and `--fx-risk-k` retain basket settings. Both the runner and supervisor accept these flags.
 - `volatility/`: V1 uses a typed state, news-triggered integrated-variance forecast, all-option Black-Scholes values and Greeks, executable-price edges after commissions/hedging reserves, ATM straddle selection, hysteresis exits, RTM hedge band, put-call-parity scan, and structured decision data. All thresholds are in `VolatilityConfig`.
 - `reference/`: unmodified official starter scripts. These require their own third-party dependencies and some can submit trades; do not use them as the project entry point.
 - `CASES.md`: source links, rules, ambiguities, and next implementation steps.

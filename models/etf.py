@@ -9,7 +9,6 @@ EQUITY_FEE = 0.02
 DEFAULT_ENTRY_BUFFER_CAD = 0.10
 CONVERTER_BLOCK = 10_000
 CONVERTER_COST_USD = 1_500
-TENDER_MIN_ADVERSE_MOVE_USD_PER_SHARE = 0.05
 
 
 def exposure(positions: Mapping[str, float]) -> dict[str, float]:
@@ -187,8 +186,10 @@ def basket_close_now(snapshot: Mapping[str, Any], held: Mapping[str, Any]) -> di
     converted through the current FX book.
     """
     entry_fills = list(held["entry_fills"])
-    exit_fills = [executable_trade_cashflow(snapshot, row["ticker"], -int(row["quantity"]))
-                  for row in entry_fills]
+    quantities = {ticker: sum(int(row["quantity"]) for row in entry_fills if row["ticker"] == ticker)
+                  for ticker in WEIGHTS}
+    exit_fills = [executable_trade_cashflow(snapshot, ticker, -quantity)
+                  for ticker, quantity in quantities.items() if quantity]
     cash = cashflow_totals([*entry_fills, *exit_fills])
     fx = net_usd_value_cad(snapshot, cash["USD"])
     return {"entry_fills": entry_fills, "exit_fills": exit_fills,
@@ -196,95 +197,34 @@ def basket_close_now(snapshot: Mapping[str, Any], held: Mapping[str, Any]) -> di
             "fx": fx, "pnl_cad": cash["CAD"] + fx["cad_value"]}
 
 
-def serial_basket_choice(snapshot: Mapping[str, Any], filled: Iterable[Mapping[str, Any]],
-                         remaining_legs: Iterable[tuple[str, int]]) -> dict[str, Any]:
-    """Compare finishing a serial basket with reversing already-filled legs.
-
-    Finishing is valued by combining immutable fill cashflows with current
-    executable prices for the remaining entry legs, marked at the non-executed
-    FX reference. Aborting is valued as executable close-now P&L on only the
-    filled legs, including final net-USD conversion.
-    """
+def basket_abort_now(snapshot: Mapping[str, Any], filled: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Value reversing the confirmed portion of a serial basket immediately."""
     filled_rows = list(filled)
-    remaining_rows = [executable_trade_cashflow(snapshot, ticker, int(quantity))
-                      for ticker, quantity in remaining_legs]
-    finish_value = basket_entry_value_cad(snapshot, [*filled_rows, *remaining_rows])
     abort_exits = [executable_trade_cashflow(snapshot, row["ticker"], -int(row["quantity"]))
                    for row in reversed(filled_rows)]
     abort_cash = cashflow_totals([*filled_rows, *abort_exits])
     abort_fx = net_usd_value_cad(snapshot, abort_cash["USD"])
     abort_pnl = abort_cash["CAD"] + abort_fx["cad_value"]
-    return {"finish_value_cad": finish_value, "abort_pnl_cad": abort_pnl,
-            "finish": finish_value >= 0 and finish_value >= abort_pnl,
-            "projected_remaining_fills": remaining_rows,
-            "abort_exit_fills": abort_exits, "abort_fx": abort_fx}
+    return {"abort_pnl_cad": abort_pnl, "abort_exit_fills": abort_exits, "abort_fx": abort_fx}
 
 
-def _tender_liquidation_reserve(snapshot: Mapping[str, Any], action: str, quantity: int,
-                                edge_usd: float) -> dict[str, float]:
-    """Stress a tender unwind for depth, serial-child drift, and one extra FX spread.
+def serial_basket_choice(snapshot: Mapping[str, Any], filled: Iterable[Mapping[str, Any]],
+                         remaining_legs: Iterable[tuple[str, int]]) -> dict[str, Any]:
+    """Compatibility wrapper for the basket convergence policy.
 
-    The old fixed C$0.0025/share threshold was negligible relative to one tick.
-    This reserve scales with tender size, observed depth slippage, quoted spread,
-    and the number of legal RITC child orders. It is intentionally conservative.
+    New callers should supply their explicit policy configuration through
+    :func:`models.etf_basket.serial_report`; this legacy entry point preserves
+    the old function name without restoring its incompatible entry-mark test.
     """
-    unwind = "SELL" if action == "BUY" else "BUY"
-    book = snapshot["books"]["RITC"]
-    best = _best_price(book, unwind)
-    full = vwap(book, unwind, quantity)
-    spread = max(0.0, _best_price(book, "BUY") - _best_price(book, "SELL"))
-    depth_slippage = abs(full - best)
-    securities = {row["ticker"]: row for row in snapshot["securities"]}
-    child_cap = max(1, min(10_000, int(securities["RITC"].get("max_trade_size", 10_000))))
-    children = math.ceil(quantity / child_cap)
-    adverse_per_share = (max(TENDER_MIN_ADVERSE_MOVE_USD_PER_SHARE, 2 * spread)
-                         + depth_slippage + 0.5 * spread * max(0, children - 1))
-    reserve_usd = quantity * adverse_per_share
-    fx_book = snapshot["books"]["USD"]
-    fx_bid = _best_price(fx_book, "SELL")
-    fx_ask = _best_price(fx_book, "BUY")
-    fx_spread = max(0.0, fx_ask - fx_bid)
-    fx_rate = fx_ask
-    reserve_cad = reserve_usd * fx_rate + abs(edge_usd) * fx_spread
-    return {"reserve_cad": reserve_cad, "reserve_usd": reserve_usd,
-            "adverse_usd_per_share": adverse_per_share,
-            "observed_depth_slippage_usd_per_share": depth_slippage,
-            "ritc_spread_usd": spread, "child_orders": children,
-            "fx_spread_cad_per_usd": fx_spread}
+    from models.etf_basket import BasketConfig, serial_report
+    from models.etf_policy import ETFConfig
+    return serial_report(snapshot, filled, remaining_legs, BasketConfig(), ETFConfig())
 
 
 def tender_opportunity(snapshot: Mapping[str, Any], offer: Mapping[str, Any]) -> dict[str, Any]:
-    """Price a fixed RITC tender through liquidation and final net USD conversion."""
-    report = {"tender_id": offer["tender_id"], "decision": "REVIEW"}
-    try:
-        if offer["ticker"] != "RITC" or not offer["is_fixed_bid"]:
-            raise ValueError("only fixed-price RITC tenders supported")
-        action, quantity = offer["action"], offer["quantity"]
-        if action not in ("BUY", "SELL"):
-            raise ValueError("unknown tender action")
-        if not isinstance(quantity, (int, float)) or quantity <= 0 or int(quantity) != quantity:
-            raise ValueError("tender quantity must be a positive integer")
-        quantity = int(quantity)
-        unwind = "SELL" if action == "BUY" else "BUY"
-        market = vwap(snapshot["books"]["RITC"], unwind, quantity)
-        edge_usd = ((market - offer["price"]) * (1 if action == "BUY" else -1) - EQUITY_FEE) * quantity
-        starting_usd = next((float(row["position"]) for row in snapshot["securities"] if row["ticker"] == "USD"), 0.0)
-        resulting_usd = starting_usd + edge_usd
-        starting_fx = net_usd_value_cad(snapshot, starting_usd)
-        resulting_fx = net_usd_value_cad(snapshot, resulting_usd)
-        edge_cad = resulting_fx["cad_value"] - starting_fx["cad_value"]
-        reserve = _tender_liquidation_reserve(snapshot, action, quantity, edge_usd)
-        report.update(estimated_unwind_profit_usd=edge_usd,
-                      estimated_unwind_profit_cad=edge_cad,
-                      starting_usd_balance=starting_usd,
-                      resulting_net_usd_balance=resulting_usd,
-                      net_fx_action=resulting_fx["action"], net_fx_price=resulting_fx["fx_price"],
-                      liquidation_reserve_cad=reserve["reserve_cad"],
-                      liquidation_reserve=reserve,
-                      note="Full-depth estimate; final net USD is converted only after liquidation.")
-    except (ValueError, KeyError) as error:
-        report["skip"] = str(error)
-    return report
+    """Compatibility entry point for portfolio-aware tender route analysis."""
+    from models.etf_policy import ETFConfig, tender_report
+    return tender_report(snapshot, offer, ETFConfig())
 
 
 def _converter_route(snapshot: Mapping[str, Any], positions: Mapping[str, float], converter: str,
