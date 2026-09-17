@@ -199,6 +199,29 @@ class ETFAccounting(unittest.TestCase):
         self.assertTrue(exchange.is_flat())
         self.assertAlmostEqual(exchange.realized_pnl_cad, 9_444.60, places=2)
 
+    def test_manual_converter_simulator_tracks_fee_and_final_realized_pnl(self):
+        exchange = ETFExchange()
+        exchange.state["tenders"] = [{"tender_id": 8, "ticker": "RITC", "action": "BUY",
+                                      "is_fixed_bid": True, "price": 20.0,
+                                      "quantity": 10_000, "expires": 30}]
+        bot = Bot(exchange, exchange, case="etf", gross_limit=300_000, net_limit=200_000)
+        self.assertEqual(bot.step(exchange.snapshot())["tender_id"], 8)
+        # Direct RITC liquidation deteriorates after the tender, making the
+        # manual redemption route the better executable unwind.
+        exchange.state["books"]["RITC"]["bids"] = [{"price": 24.50, "quantity": 1_000_000}]
+        manual = bot.step(exchange.snapshot())["manual_converter"]
+        self.assertEqual((manual["converter"], manual["blocks"]), ("ETF-Redemption", 1))
+        exchange.converter(manual["converter"], manual["blocks"])
+        self.assertEqual(exchange.positions()["USD"], -201_500)
+        self.assertEqual(exchange.events[-1], {"event": "converter", "name": "ETF-Redemption", "blocks": 1})
+        for _ in range(4):
+            if exchange.is_flat():
+                break
+            bot.step(exchange.snapshot())
+        self.assertTrue(exchange.is_flat())
+        self.assertAlmostEqual(exchange.commission_cad, 400.0)
+        self.assertAlmostEqual(exchange.realized_pnl_cad, 45_885.0, places=2)
+
     def test_serial_basket_reprices_and_reverses_after_bad_first_fill(self):
         exchange = ETFExchange()
         def shock(ex: ETFExchange, count: int) -> None:
