@@ -117,8 +117,36 @@ A known open account order makes the ETF worker wait without submitting or cance
 - A preferred manual route prints `MANUAL WIND/UNWIND REQUIRED` and a deadline. The default wait is eight ticks after preparation, subject to enough remaining time for liquidation. After timeout, direct reduction stays latched until flat. Forced end-of-round or `--flatten-only` liquidation always overrides manual waiting. Set `--manual-wait-ticks 0` to disable manual routes, including converter-dependent tender acceptance. If a manual action is missed or markets move, the direct fallback can realize a loss.
 - Otherwise unwind existing equity inventory one child at a time, selecting a risk-legal order with enough visible depth. On restart, existing baskets are treated as inventory to close.
 - Accept only fixed-price RITC tenders whose selected route clears the larger of C$0.0025/share or the execution-plus-FX uncertainty reserve. Frozen-book routes consume each displayed level once. Direct RITC depth is not required when a complete legal converter route supplies an exit. Staged direct routes have additional evidence and stress-exit checks below. Every route must fit before case end, with legal child sizes, final FX children, a manual allowance where needed, and a five-tick end buffer. Tender expiry is only the acceptance deadline; a fresh full snapshot must still contain and approve the offer before submission.
-- `DIRECT_STAGED` is enabled by default for tenders taken from an equity-flat account. It requires at least four past arrival intervals spanning 12 ticks. Only previously unseen RITC order IDs created since the previous observation and within US$0.05 of the current touch count. Pace children at no more than 50% of the lower-quartile observed arrival rate. Repeated snapshots and old displayed orders do not count as replenishment; history resets each heat and evidence older than two ticks is unavailable. Missing order IDs/timestamps disable this forecast, not ordinary frozen-book trading.
-- Staged pricing gives only 50% credit for recovery from depleted-book VWAP toward current child VWAP, with an additional US$0.05 adverse-price allowance on the refreshed reference. This is a forecast, not certain liquidity. The full frozen-book direct exit must remain priceable and its modeled loss must not exceed `--tender-max-fallback-loss 0.15` CAD/share. The schedule must fit `--tender-max-unwind-ticks 60` and the case deadline; all forecast AND fallback cash/stock stages are checked. `--no-staged-tenders` disables the model. Both runner and supervisor accept these controls.
+- `DIRECT_STAGED` is enabled by default for tenders taken from an equity-flat account. It requires at least four past arrival intervals spanning 12 ticks and at least `--staged-min-active-intervals 2` **nonzero** intervals. Only previously unseen RITC order IDs created since the previous observation and within US$0.05 of the current touch count. Pace children at no more than `--staged-participation 0.5` of the median nonzero arrival rate. Repeated snapshots and old displayed orders do not count as replenishment; history resets each heat and evidence older than two ticks is unavailable. Missing order IDs/timestamps disable this forecast, not ordinary frozen-book trading.
+- Staged pricing gives only 50% credit for recovery from depleted-book VWAP toward current child VWAP, with an additional US$0.05 adverse-price allowance on the refreshed reference. This is a forecast, not certain liquidity. The full frozen-book direct exit must remain priceable and its modeled loss must not exceed `--tender-max-fallback-loss 0.10` CAD/share. The schedule must fit `--tender-max-unwind-ticks 60` and the case deadline; all forecast AND fallback cash/stock stages are checked. `--no-staged-tenders` disables the model. Both runner and supervisor accept these controls.
+
+The September 17 direct-route ablation in `analysis/etf_ablation.py` used 14
+recorded heats, optimized chronologically on the first nine and held out the
+last five. It compares only independent, flat-account direct routes and
+crosses later recorded books; it cannot model manual conversions, market
+impact, queue position, concurrent offers, or realized server P&L. The
+selected robust gate kept the tender reserve coefficients at 0.15/0.25,
+required two active intervals, credited 50% participation, and used the
+C$0.10/share fallback. It accepted 5 training and 2 held-out offers; the
+held-out two simulated outcomes were positive. This is too little data to
+claim an optimum or profitability guarantee, and the report remains an offline
+counterfactual rather than a live backtest.
+
+For controlled **live practice** comparison, keep basket trading disabled and
+launch exactly one tender policy per new heat:
+
+```sh
+python3 scripts/run_etf_live_ablation.py --trade \
+  --gross-limit 300000 --net-limit 200000
+```
+
+It waits for a stop/reset after launch and starts only at tick 0--2 of the
+next heat. The three arms are frozen-book baseline, selected staged policy,
+and stricter staged policy. Each has separate ignored journal, decision-log,
+and raw-snapshot files under `data/etf-ablation-*`; a worker error halts the
+experiment rather than proceeding to another arm. The script does not enable
+`--basket`, does not test low-reserve settings, and never joins the currently
+active heat.
 - After a staged acceptance, new tenders and conversions are deferred. Submit one confirmed child per slot only when fresh depth meets its forecast price bound. Wait at most six additional ticks for a missed slot, never past the route deadline. Lost fallback depth, changed inventory, the loss trigger, or a missed deadline latches direct liquidation through final USD. No mutation is retried. The loss trigger is **not** a guaranteed maximum realized loss: quotes can gap and market orders can slip. Console alerts explicitly label staged forecasts and show frozen-book fallback P&L.
 - Execution reserve in CAD is `k_exec × sum(abs(child shares) × sigma_price × sqrt(time to child fill) × currency conversion)`. FX reserve is `k_fx × abs(final net USD) × sigma_FX × sqrt(route horizon)`. Price sigmas are trailing RMS midpoint changes per square root of tick, using up to 30 past intervals from the current heat. Startup uses a quarter-spread proxy and explicit floors (0.005 equity quote-currency dollars and 0.0001 CAD/USD per square root of tick). Three ticks per action is the initial scheduling assumption. Spread, depth and commissions are already in route cashflows and are not charged again as uncertainty.
 - Basket coefficients remain `--execution-risk-k 0.25 --fx-risk-k 0.5`. Tender reserves use independent `--tender-execution-risk-k 0.15 --tender-fx-risk-k 0.25` defaults in both runner and supervisor. These are risk preferences, not statistical guarantees. The September 17 logged heat (ticks 82–298) contained six distinct tenders; five never showed a positive executable route, while tender 3131 at tick 203 showed a three-block redemption profit of C$8,530.32 against the former C$10,192.46 reserve. The revised weights reduce that route's allowance to C$5,602.28. This is a counterfactual eligibility calculation on recorded decisions, not a simulated fill or realized-P&L backtest. The route still requires manual conversion and all existing risk/time checks.

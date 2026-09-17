@@ -155,6 +155,10 @@ def main() -> None:
     parser.add_argument("--tender-max-fallback-loss", type=float, default=ETFConfig.tender_max_fallback_loss,
                         help="Maximum modeled frozen-book loss per staged tender share, CAD")
     parser.add_argument("--tender-max-unwind-ticks", type=int, default=ETFConfig.tender_max_unwind_ticks)
+    parser.add_argument("--staged-min-active-intervals", type=int, default=ETFConfig.staged_min_active_intervals,
+                        help="Nonzero near-touch arrival intervals required for a staged tender")
+    parser.add_argument("--staged-participation", type=float, default=ETFConfig.staged_participation,
+                        help="Maximum fraction of observed near-touch flow credited to staged tender exits")
     parser.add_argument("--manual-wait-ticks", type=int, default=8)
     parser.add_argument("--basket-max-hold-ticks", type=int, default=BasketConfig.max_hold_ticks)
     parser.add_argument("--basket-min-hold-ticks", type=int, default=BasketConfig.min_hold_ticks)
@@ -196,6 +200,8 @@ def main() -> None:
                                staged_tenders=not args.no_staged_tenders,
                                tender_max_fallback_loss=args.tender_max_fallback_loss,
                                tender_max_unwind_ticks=args.tender_max_unwind_ticks,
+                               staged_min_active_intervals=args.staged_min_active_intervals,
+                               staged_participation=args.staged_participation,
                                child_size=args.child_size, manual_wait_ticks=args.manual_wait_ticks)
         basket_config = BasketConfig(max_hold_ticks=args.basket_max_hold_ticks,
                                      min_hold_ticks=args.basket_min_hold_ticks,

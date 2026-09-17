@@ -56,6 +56,8 @@ def worker_command(args: argparse.Namespace) -> list[str]:
                             ("--tender-fx-risk-k", args.tender_fx_risk_k),
                             ("--tender-max-fallback-loss", args.tender_max_fallback_loss),
                             ("--tender-max-unwind-ticks", args.tender_max_unwind_ticks),
+                            ("--staged-min-active-intervals", args.staged_min_active_intervals),
+                            ("--staged-participation", args.staged_participation),
                             ("--manual-wait-ticks", args.manual_wait_ticks),
                             ("--basket-max-hold-ticks", args.basket_max_hold_ticks),
                             ("--basket-min-hold-ticks", args.basket_min_hold_ticks),
@@ -152,6 +154,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-staged-tenders", action="store_true", help="Use frozen-book tender routes only")
     parser.add_argument("--tender-max-fallback-loss", type=float, default=ETFConfig.tender_max_fallback_loss)
     parser.add_argument("--tender-max-unwind-ticks", type=int, default=ETFConfig.tender_max_unwind_ticks)
+    parser.add_argument("--staged-min-active-intervals", type=int, default=ETFConfig.staged_min_active_intervals)
+    parser.add_argument("--staged-participation", type=float, default=ETFConfig.staged_participation)
     parser.add_argument("--manual-wait-ticks", type=int, default=8)
     parser.add_argument("--basket-max-hold-ticks", type=int, default=BasketConfig.max_hold_ticks)
     parser.add_argument("--basket-min-hold-ticks", type=int, default=BasketConfig.min_hold_ticks)
@@ -169,6 +173,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                   staged_tenders=not args.no_staged_tenders,
                   tender_max_fallback_loss=args.tender_max_fallback_loss,
                   tender_max_unwind_ticks=args.tender_max_unwind_ticks,
+                  staged_min_active_intervals=args.staged_min_active_intervals,
+                  staged_participation=args.staged_participation,
                   child_size=args.child_size, manual_wait_ticks=args.manual_wait_ticks)
         BasketConfig(max_hold_ticks=args.basket_max_hold_ticks,
                      min_hold_ticks=args.basket_min_hold_ticks,

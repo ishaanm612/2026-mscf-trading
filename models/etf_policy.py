@@ -29,12 +29,15 @@ class ETFConfig:
     min_profit_cad_per_share: float = 0.0025
     child_size: int = 10_000
     staged_tenders: bool = True
-    tender_max_fallback_loss: float = 0.15  # CAD/share, frozen-book stress scenario
+    tender_max_fallback_loss: float = 0.10  # CAD/share, frozen-book stress scenario
     tender_max_unwind_ticks: int = 60
+    staged_min_active_intervals: int = 2
+    staged_participation: float = 0.50
 
     def __post_init__(self) -> None:
         values = (self.execution_k, self.fx_k, self.tender_execution_k, self.tender_fx_k, self.equity_sigma_floor,
-                  self.fx_sigma_floor, self.min_profit_cad_per_share, self.tender_max_fallback_loss)
+                  self.fx_sigma_floor, self.min_profit_cad_per_share, self.tender_max_fallback_loss,
+                  self.staged_participation)
         if any(not math.isfinite(x) or x < 0 for x in values):
             raise ValueError("ETF reserve parameters must be finite and nonnegative")
         if not math.isfinite(self.ticks_per_action) or self.ticks_per_action <= 0:
@@ -43,6 +46,10 @@ class ETFConfig:
             raise ValueError("Invalid ETF child size or deadline configuration")
         if self.tender_max_unwind_ticks < 1:
             raise ValueError("Tender unwind horizon must be positive")
+        if (isinstance(self.staged_min_active_intervals, bool)
+                or not isinstance(self.staged_min_active_intervals, int)
+                or self.staged_min_active_intervals < 1):
+            raise ValueError("Staged tender active-interval count must be a positive integer")
 
 
 class MarketRisk:

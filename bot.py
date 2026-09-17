@@ -68,7 +68,9 @@ class Bot:
         self.basket_cooldown_until = 0
         self.basket_exit_context: dict[str, Any] = {}
         self.etf_market_risk = etf_policy.MarketRisk()
-        self.etf_liquidity = LiquidityHistory()
+        self.etf_liquidity = LiquidityHistory(
+            min_active_intervals=self.etf_config.staged_min_active_intervals,
+            participation=self.etf_config.staged_participation)
         self.etf_sigmas: dict[str, float] = {}
         self.etf_assessments: list[dict[str, Any]] = []
         self.manual_since: int | None = None

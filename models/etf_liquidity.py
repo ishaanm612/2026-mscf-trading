@@ -16,9 +16,18 @@ from models import etf
 
 
 class LiquidityHistory:
-    """Past-only near-touch RITC arrivals, reset on each observed heat boundary."""
+    """Past-only near-touch RITC arrivals, reset on each observed heat boundary.
 
-    def __init__(self) -> None:
+    The default requires two nonzero arrival intervals and uses one half of
+    their median rate. A zero-filled quantile treats intermittent liquidity as
+    impossible liquidity; that proved too brittle in the recorded heats.
+    """
+
+    def __init__(self, *, min_active_intervals: int = 2, participation: float = .50) -> None:
+        if min_active_intervals < 1 or not 0 < participation <= 1:
+            raise ValueError("Invalid staged-liquidity parameters")
+        self.min_active_intervals = min_active_intervals
+        self.participation = participation
         self.previous = None
         self.intervals = {side: deque(maxlen=10) for side in ("bids", "asks")}
         self.seen: set[int] = set()
@@ -26,7 +35,7 @@ class LiquidityHistory:
     def observe(self, snapshot: Mapping[str, Any]) -> None:
         tick, period = snapshot["case"]["tick"], snapshot["case"].get("period")
         if self.previous and (tick < self.previous[0] or period != self.previous[1]):
-            self.__init__()
+            self.__init__(min_active_intervals=self.min_active_intervals, participation=self.participation)
         if self.previous and tick == self.previous[0]:
             return
         book = snapshot["books"]["RITC"]
@@ -51,16 +60,20 @@ class LiquidityHistory:
             return None
         age = snapshot["case"]["tick"] - self.previous[0]
         history = self.intervals[side]
-        if not 0 <= age <= 2 or len(history) < 4 or sum(dt for dt, _ in history) < 12:
+        active = [value for _, value in history if value > 0]
+        if (not 0 <= age <= 2 or len(history) < 4 or sum(dt for dt, _ in history) < 12
+                or len(active) < self.min_active_intervals):
             return None
-        # Lower quartile, then 50% participation: a few busy ticks cannot
-        # justify taking the entire advertised flow for ourselves.
-        rate = sorted(value for _, value in history)[(len(history) - 1) // 4] * .5
+        # Median of nonzero intervals preserves an intermittent-but-observed
+        # arrival signal, while participation explicitly limits our assumed
+        # share of it.
+        rate = sorted(active)[(len(active) - 1) // 2] * self.participation
         if rate <= 0:
             return None
-        return {"shares_per_tick": rate, "intervals": len(history),
+        return {"shares_per_tick": rate, "intervals": len(history), "active_intervals": len(active),
                 "history_ticks": sum(dt for dt, _ in history), "observation_age_ticks": age,
-                "participation": .5, "near_touch_band_usd": .05}
+                "participation": self.participation, "near_touch_band_usd": .05,
+                "estimator": "nonzero-median"}
 
 
 def staged_direct(snapshot: Mapping[str, Any], positions: Mapping[str, float],

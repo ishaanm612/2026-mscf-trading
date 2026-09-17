@@ -50,6 +50,19 @@ class StagedTenderTests(unittest.TestCase):
         history.observe(s)
         self.assertIsNone(history.estimate(s, "bids"))
 
+    def test_default_gate_uses_two_nonzero_intervals_not_zero_filled_quantile(self):
+        history = LiquidityHistory()
+        s = etf_snapshot()
+        # Two separated arrivals amid empty intervals are evidence of some
+        # replenishment; the old lower quartile collapsed this to zero.
+        for tick, fresh in ((1, False), (4, True), (7, False), (10, True), (13, False), (16, False)):
+            book(s, tick, fresh=fresh)
+            history.observe(s)
+        estimate = history.estimate(s, "bids")
+        self.assertIsNotNone(estimate)
+        self.assertEqual(estimate["active_intervals"], 2)
+        self.assertEqual(estimate["participation"], .5)
+
     def test_cold_history_does_not_manufacture_liquidity(self):
         ex, bot = warmed()
         bot.etf_liquidity = LiquidityHistory()
@@ -209,6 +222,13 @@ class StagedTenderTests(unittest.TestCase):
         self.assertIn("--no-staged-tenders", cmd)
         self.assertEqual(cmd[cmd.index("--tender-max-fallback-loss") + 1], "0.08")
         self.assertEqual(cmd[cmd.index("--tender-max-unwind-ticks") + 1], "40")
+
+    def test_supervisor_forwards_arrival_gate_controls(self):
+        args = parse_args(["--case", "etf", "--gross-limit", "300000", "--net-limit", "200000",
+                           "--staged-min-active-intervals", "3", "--staged-participation", ".4"])
+        cmd = worker_command(args)
+        self.assertEqual(cmd[cmd.index("--staged-min-active-intervals") + 1], "3")
+        self.assertEqual(cmd[cmd.index("--staged-participation") + 1], "0.4")
 
 
 if __name__ == "__main__":
