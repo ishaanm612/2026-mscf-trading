@@ -39,6 +39,8 @@ DELTA_BAND = 7000     # penalty band: $0.10 per share over, per second
 # ~1.4-1.7x what 500 plain straddles gave under the same net cap.
 ATM_STRADDLES = 850    # straddles at the ATM strike, in the edge direction
 WING_CONTRACTS = 350   # contracts per far wing (lowest put + highest call), opposite way
+LATE_ENTRY_TICK = 260  # from here, new entries at half size: late deep-ITM books
+LATE_ENTRY_SCALE = 0.5 # were the worst trips and carry unhedgeable-delta fine risk
 ENTRY_EDGE = 15.0      # $ per straddle, net of costs, required to enter
                        # $10 was noise-chasing (heat 1), but $40 exceeds what
                        # late-heat vega (~$6-8 per vol pt at tick 150+) can even
@@ -142,13 +144,19 @@ def process_tick(client, dry_run, decisions_path, market_path):
          ............................. close options AND RTM hedge, interleaved
          (exit MUST outrank the hedge: a big book breaches the hedge trigger
          every tick and would starve the exit forever)
-      4. |delta| >= 2,000 ............. hedge full delta back toward zero
-      5. holding otherwise ............ hold, showing the remaining edge
-      6. flat + straddle edge > $15 ... enter 850 ATM straddles + 350/wing
-         ............................. opposite strangle (gross 2400, net 1000)
-      7. otherwise .................... wait, printing the insufficient edge
+      4. option delta beyond RTM hedge capacity
+         ............................. deleverage: close highest-delta legs
+      5. |delta| >= 2,000 ............. hedge full delta back toward zero
+      6. holding otherwise ............ hold, showing the remaining edge
+      7. flat + straddle edge > $15 ... enter ATM straddles + opposite wings
+         (wings exclude the ATM strike; half size from tick 260)
+      8. otherwise .................... wait, printing the insufficient edge
     """
     case = client.get("case")
+    if "volatility" not in str(case.get("name", "")).lower():
+        # Server ports get reshuffled between practice days; never trade a
+        # case this bot was not built for.
+        raise RuntimeError(f"connected to wrong case: {case.get('name')!r} -- check the port")
     tick, status = int(case["tick"]), str(case["status"])
     securities = client.get("securities")
     raw_news = client.get("news")
@@ -229,6 +237,31 @@ def process_tick(client, dry_run, decisions_path, market_path):
             # book is never one-legged mid-unwind (heat 1 and 3 fine source).
             trades = weave([(o["symbol"], -o["position"]) for o in options if o["position"]],
                            -rtm_position, book_net=net)
+        elif gross and abs(rtm_position - round(delta)) - RTM_LIMIT > 2000:
+            # Hedgeability guard: near expiry a deep-ITM book can carry more
+            # delta than RTM can hedge (~85k shares vs the 50k limit in heat 6
+            # of the endurance run: ~$2.6k/sec of band fines, unfixable by
+            # hedging). Close the highest-delta legs until the rest is
+            # hedgeable, with ~2k shares of headroom on each side.
+            excess = abs(rtm_position - round(delta)) - RTM_LIMIT
+            held = sorted((o for o in options if o["position"]),
+                          key=lambda o: -abs(pricing.bs_delta(o["kind"], spot, o["strike"],
+                                                              years, rate, sigma) * o["position"]))
+            closes, reduction = [], 0.0
+            for option in held:
+                per_contract = abs(pricing.bs_delta(option["kind"], spot, option["strike"],
+                                                    years, rate, sigma)) * MULT
+                if per_contract < 1.0:
+                    continue
+                quantity = min(abs(option["position"]), int((excess + 2000 - reduction) / per_contract) + 1)
+                closes.append((option["symbol"], -quantity if option["position"] > 0 else quantity))
+                reduction += quantity * per_contract
+                if reduction >= excess + 2000:
+                    break
+            decision = (f"deleverage: option delta {abs(rtm_position - delta):.0f} exceeds RTM hedge"
+                        f" capacity by {excess:.0f} shares, closing {sum(abs(q) for _, q in closes)}"
+                        f" contracts to stay hedgeable")
+            trades = weave(closes, book_net=net)
         elif abs(delta) >= HEDGE_TRIGGER:
             # Hedge the FULL delta (submit() splits it into 10k-share orders);
             # capping at one order per tick let big strike-crossing delta flips
@@ -244,18 +277,30 @@ def process_tick(client, dry_run, decisions_path, market_path):
         elif max(buy_edge, sell_edge) > ENTRY_EDGE:
             sign = 1 if buy_edge >= sell_edge else -1
             side = "BUY" if sign > 0 else "SELL"
-            # ATM straddles in the edge direction plus opposite far wings:
-            # entry happens only from flat, so the constants are the limits.
-            low_put = min((o for o in options if o["kind"] == "P"), key=lambda o: o["strike"])
-            high_call = max((o for o in options if o["kind"] == "C"), key=lambda o: o["strike"])
-            decision = (f"enter: {side} {ATM_STRADDLES} straddles @ K={strike:g}"
-                        f" + {'SELL' if sign > 0 else 'BUY'} {WING_CONTRACTS} wings"
-                        f" @ {low_put['symbol']}/{high_call['symbol']},"
+            # ATM straddles in the edge direction plus opposite far wings.
+            # Wings must EXCLUDE the ATM strike: on a 48-52 chain an entry at
+            # an edge strike used to trade its wing INTO its own ATM leg,
+            # self-cancelling ~30% of the intended vega (1/3 of endurance-run
+            # entries). If the chain has no strike on one side, the surviving
+            # wing doubles up; with no wing at all, cap ATM at the net limit.
+            scale = LATE_ENTRY_SCALE if tick >= LATE_ENTRY_TICK else 1.0
+            atm_size, wing_size = int(ATM_STRADDLES * scale), int(WING_CONTRACTS * scale)
+            low_put = min((o for o in options if o["kind"] == "P" and o["strike"] < strike),
+                          key=lambda o: o["strike"], default=None)
+            high_call = max((o for o in options if o["kind"] == "C" and o["strike"] > strike),
+                            key=lambda o: o["strike"], default=None)
+            wings = ([(low_put, wing_size), (high_call, wing_size)] if low_put and high_call
+                     else [(low_put, 2 * wing_size)] if low_put
+                     else [(high_call, 2 * wing_size)] if high_call else [])
+            if not wings:
+                atm_size = min(atm_size, NET_LIMIT // 2)
+            wing_text = "+".join(f"{q}x{o['symbol']}" for o, q in wings) or "none"
+            decision = (f"enter: {side} {atm_size} straddles @ K={strike:g}"
+                        f" + {'SELL' if sign > 0 else 'BUY'} wings {wing_text},"
                         f" edge ${max(buy_edge, sell_edge):.0f}/straddle > ${ENTRY_EDGE:.0f} threshold")
-            trades = weave([(call["symbol"], sign * ATM_STRADDLES),
-                            (put["symbol"], sign * ATM_STRADDLES),
-                            (low_put["symbol"], -sign * WING_CONTRACTS),
-                            (high_call["symbol"], -sign * WING_CONTRACTS)])
+            trades = weave([(call["symbol"], sign * atm_size),
+                            (put["symbol"], sign * atm_size)]
+                           + [(o["symbol"], -sign * q) for o, q in wings])
         else:
             decision = f"wait: best edge ${max(buy_edge, sell_edge):.0f}/straddle below ${ENTRY_EDGE:.0f} threshold"
 
