@@ -4,6 +4,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Mapping
+from client import RITReadError
 
 
 def _read_events(path: Path) -> list[dict[str, Any]]:
@@ -41,6 +42,7 @@ class Executor:
         :raises RuntimeError: If the prior journal has unresolved activity.
         """
         self.client = client
+        self.unresolved_intent = False
         self.path = Path(journal)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Exclusive process lock prevents two runners from sharing an account journal.
@@ -70,6 +72,7 @@ class Executor:
         """
         started = time.monotonic()
         self.log("intent", ticker=ticker, quantity=quantity)
+        self.unresolved_intent = True
         result = self.client.request("POST", "orders", ticker=ticker, type="MARKET",
                                      action="BUY" if quantity > 0 else "SELL", quantity=abs(quantity))
         order_id = result["order_id"]
@@ -79,6 +82,7 @@ class Executor:
             if order["quantity_filled"] == abs(quantity) and order["status"] != "OPEN":
                 self.log("filled", order_id=order_id, ticker=ticker, quantity=quantity,
                          duration_seconds=time.monotonic() - started, order=dict(order))
+                self.unresolved_intent = False
                 return order
             if order["status"] != "OPEN":
                 self.log("incomplete", order_id=order_id, filled=order["quantity_filled"])
@@ -89,14 +93,53 @@ class Executor:
         raise RuntimeError("Order did not complete; cancellation requested, reconcile before restart")
 
     def tender(self, offer: Mapping[str, Any], position_before: int) -> None:
-        """Accept a fixed offer once and verify its inventory effect before unwinding."""
-        self.log("tender_intent", tender_id=offer["tender_id"])
-        self.client.request("POST", f"tenders/{offer['tender_id']}", price=offer["price"])
+        """Accept once, then allow bounded read-only settlement confirmation.
+
+        DMA can acknowledge acceptance before securities reflects the tender.
+        Poll only an unchanged pre-tender position; a partial/unexpected change,
+        session boundary, read failure, or timeout leaves the intent unresolved.
+        Neither acceptance nor an ambiguous mutation is ever retried.
+        """
+        case = self.client.get("case")
+        if (case["status"] != "ACTIVE" or case["tick"] >= 299
+                or offer.get("period", case.get("period")) != case.get("period")
+                or case["tick"] > offer.get("expires", case["tick"])):
+            raise RITReadError("Tender preflight expired; no acceptance submitted")
+        started = time.monotonic()
         expected = position_before + offer["quantity"] * (1 if offer["action"] == "BUY" else -1)
-        positions = {s["ticker"]: s["position"] for s in self.client.get("securities")}
-        if positions[offer["ticker"]] != expected:
-            raise RuntimeError("Tender position is not confirmed; reconcile before restart")
-        self.log("tender_confirmed", tender_id=offer["tender_id"])
+        self.log("tender_intent", tender_id=offer["tender_id"], ticker=offer["ticker"],
+                 action=offer["action"], quantity=offer["quantity"], price=offer["price"],
+                 position_before=position_before, expected_position=expected, case=case)
+        self.unresolved_intent = True
+        response = self.client.request("POST", f"tenders/{offer['tender_id']}", price=offer["price"])
+        self.log("tender_submitted", tender_id=offer["tender_id"], response=response)
+        last_tick = case["tick"]
+        for attempt in range(12):
+            before = self.client.get("case")
+            positions = {s["ticker"]: s["position"] for s in self.client.get("securities")}
+            after = self.client.get("case")
+            for marker in (before, after):
+                if (marker.get("period") != case.get("period") or marker["tick"] < last_tick
+                        or marker["status"] != "ACTIVE"):
+                    self.log("tender_confirmation_failed", tender_id=offer["tender_id"],
+                             reason="session changed", case=marker, positions=positions)
+                    raise RuntimeError("Session changed during tender confirmation; reconcile before restart")
+                last_tick = marker["tick"]
+            observed = positions.get(offer["ticker"])
+            if observed == expected:
+                self.log("tender_confirmed", tender_id=offer["tender_id"], position=observed,
+                         attempts=attempt + 1, duration_seconds=time.monotonic() - started, case=after)
+                self.unresolved_intent = False
+                return
+            if observed != position_before:
+                self.log("tender_confirmation_failed", tender_id=offer["tender_id"],
+                         reason="unexpected position", observed_position=observed, expected_position=expected)
+                raise RuntimeError("Unexpected tender position; reconcile before restart")
+            if attempt < 11:
+                time.sleep(.25)
+        self.log("tender_confirmation_failed", tender_id=offer["tender_id"],
+                 reason="confirmation timeout", observed_position=observed, expected_position=expected)
+        raise RuntimeError("Tender position is not confirmed; reconcile before restart")
 
     def close(self) -> None:
         """Release the exclusive journal lock.

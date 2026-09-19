@@ -47,28 +47,24 @@ class Models(unittest.TestCase):
         self.assertLess(report["estimated_unwind_profit_usd"], 0)
         self.assertEqual(report["decision"], "REVIEW")
 
-    def test_basket_report_uses_executable_fx_and_fee_funding(self):
+    def test_basket_report_does_not_charge_unexecuted_gross_fx(self):
         snapshot = demo("etf")
-        # Tighten USD to make the expected CAD conversion and round-up explicit.
         snapshot["books"]["USD"] = {"bids": [{"price": 1.00, "quantity": 1000000}],
                                     "asks": [{"price": 1.01, "quantity": 1000000}]}
         report = etf.basket_opportunity(snapshot, 1, 1000, 300000, 200000)
-        self.assertEqual(report["fx_leg"], {"ticker": "USD", "quantity": 24830, "action": "BUY"})
+        self.assertIsNone(report["fx_leg"])
         self.assertAlmostEqual(report["basket_cad_per_unit"], 24.98)
-        self.assertAlmostEqual(report["ritc_cad_per_unit"], 24.81 * 1.01)
-        self.assertAlmostEqual(report["fees_cad_per_unit"], .04 + .02 * 1.01)
+        self.assertAlmostEqual(report["ritc_cad_per_unit"], 24.81 * 1.005)
+        self.assertAlmostEqual(report["fees_cad_per_unit"], .04 + .02 * 1.005)
         self.assertFalse(report["eligible_after_buffer"])
         self.assertTrue(report["within_configured_limits"])
 
-    def test_short_ritc_fx_leg_uses_net_sale_proceeds(self):
-        """A short RITC leg sells USD proceeds after its USD commission."""
-
+    def test_short_ritc_basket_also_defers_fx_until_final_net_usd(self):
         report = etf.basket_opportunity(demo("etf"), -1, 1000, 300000, 200000)
-        self.assertEqual(report["fx_leg"], {"ticker": "USD", "quantity": -24770, "action": "SELL"})
+        self.assertIsNone(report["fx_leg"])
+        self.assertIn("No gross FX trade", report["fx_treatment"])
 
     def test_tender_profit_is_converted_from_net_usd_to_cad(self):
-        """Tender scoring converts only final net USD profit at executable FX."""
-
         snapshot = demo("etf")
         offer = {"tender_id": 2, "ticker": "RITC", "action": "BUY",
                  "quantity": 1000, "price": 24.70, "is_fixed_bid": True}
@@ -77,8 +73,6 @@ class Models(unittest.TestCase):
         self.assertAlmostEqual(report["estimated_unwind_profit_cad"], 69.3)
 
     def test_converter_recommendations_follow_inventory_direction(self):
-        """Long RITC redeems; a covered RITC short creates ETF units."""
-
         redemption = demo("etf")
         next(row for row in redemption["securities"] if row["ticker"] == "RITC")["position"] = 10000
         rec = next(item for item in etf.manual_converter_opportunities(redemption)

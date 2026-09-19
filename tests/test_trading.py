@@ -426,6 +426,8 @@ class Trading(unittest.TestCase):
         """Reject a large tender when its legal child sequence cannot finish."""
 
         snapshot = demo("etf")
+        next(row for row in snapshot["limits"] if row["name"] == "cash").update(
+            gross_limit=10_000_000, net_limit=10_000_000)
         snapshot["case"]["tick"] = 261
         snapshot["tenders"] = [{"tender_id": 4, "ticker": "RITC", "action": "BUY",
                                  "is_fixed_bid": True, "price": 20, "quantity": 100000, "expires": 290}]
@@ -457,6 +459,8 @@ class Trading(unittest.TestCase):
     def test_basket_failure_never_submits_remaining_legs(self):
         exchange = Exchange("etf")
         exchange.state["books"]["USD"] = {"bids": [{"price": 1, "quantity": 1000000}], "asks": [{"price": 1, "quantity": 1000000}]}
+        exchange.state["books"]["RITC"] = {"bids": [{"price": 24.39, "quantity": 1000000}],
+                                            "asks": [{"price": 24.41, "quantity": 1000000}]}
         exchange.partial = True
         with tempfile.TemporaryDirectory() as directory:
             executor = Executor(exchange, Path(directory) / "journal.jsonl")

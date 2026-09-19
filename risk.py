@@ -8,6 +8,47 @@ class RiskError(ValueError):
     """A proposed action fails a known pre-trade rule."""
 
 
+def check_etf_projection(snapshot: Mapping[str, Any], projected: Mapping[str, float],
+                         gross_limit: float, net_limit: float) -> None:
+    """Check complete hypothetical positions, including tender/converter cash.
+
+    Server counters are authoritative baselines. Apply all instrument deltas
+    to them using inverse units; never silently reset them to a local estimate.
+    """
+    if snapshot.get("orders") != []:
+        raise RiskError("Open orders or missing order state")
+    if not all(math.isfinite(p) for p in projected.values()):
+        raise RiskError("Nonfinite projected position")
+    value = etf.exposure(projected)
+    if value["gross"] > gross_limit or abs(value["net"]) > net_limit:
+        raise RiskError("ETF weighted position limit")
+    limits = snapshot.get("limits")
+    if not limits:
+        raise RiskError("Missing session limits")
+    names = {limit["name"] for limit in limits}
+    gross_delta = {name: 0.0 for name in names}
+    net_delta = dict(gross_delta)
+    for security in snapshot["securities"]:
+        ticker = security["ticker"]
+        before, after = security["position"], projected.get(ticker, security["position"])
+        if before == after:
+            continue
+        bindings = security.get("limits", [])
+        if not bindings:
+            raise RiskError(f"Missing limit bindings for {ticker}")
+        for binding in bindings:
+            name, units = binding["name"], binding["units"]
+            if name not in names or not math.isfinite(units) or units <= 0:
+                raise RiskError("Invalid security limit binding")
+            gross_delta[name] += (abs(after) - abs(before)) / units
+            net_delta[name] += (after - before) / units
+    for limit in limits:
+        name = limit["name"]
+        if (limit["gross"] + gross_delta[name] > limit["gross_limit"]
+                or abs(limit["net"] + net_delta[name]) > limit["net_limit"]):
+            raise RiskError(f"Projected server {name} limit breach")
+
+
 def check(snapshot: Mapping[str, Any], ticker: str, quantity: int, case: str,
           deltas: Mapping[str, float] | None = None, gross_limit: int | None = None,
           net_limit: int | None = None, tender: bool = False) -> None:
