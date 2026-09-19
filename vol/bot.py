@@ -14,6 +14,7 @@ Run:  python3 bot.py [--dry-run]   (from inside vol/)
 """
 import argparse
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -326,8 +327,10 @@ def main():
     # decisions-*.jsonl is what the bot thought; market-*.jsonl is the full
     # raw recording (replayable with review.py and shareable as calibration
     # data -- it contains positions/P&L but no names).
-    logs = Path(__file__).parent / "logs"
-    logs.mkdir(exist_ok=True)
+    # Logs live OUTSIDE any cloud-synced folder: OneDrive renamed the live
+    # log file mid-run and fragmented two nights of recordings.
+    logs = Path(os.environ.get("RIT_LOG_DIR", Path.home() / "ritc-vol-logs"))
+    logs.mkdir(parents=True, exist_ok=True)
     tag = time.strftime("%Y%m%d-%H%M%S")
     decisions_path, market_path = logs / f"decisions-{tag}.jsonl", logs / f"market-{tag}.jsonl"
     print(f"volatility bot starting ({'DRY RUN' if args.dry_run else 'LIVE'})\n"
