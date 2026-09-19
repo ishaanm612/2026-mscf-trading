@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import patch
 
-from scripts.run_etf_live_ablation import (POLICIES, parse_args, verify_flat_new_heat, verify_worker_flat,
+from scripts.run_etf_live_ablation import (POLICIES, parse_args, run, verify_flat_new_heat, verify_worker_flat,
                                             wait_for_fresh_heat, worker_command)
 from volatility.supervisor import SessionMarker
 
@@ -34,7 +34,7 @@ class LiveAblationTests(unittest.TestCase):
         self.assertEqual(marker.tick, 0)
 
     def test_each_policy_gets_isolated_logs_and_no_basket_flag(self):
-        args = parse_args(["--trade", "--gross-limit", "300000", "--net-limit", "200000"])
+        args = parse_args(["--trade", "--gross-limit", "300000", "--net-limit", "200000", "--run-id", "test"])
         commands = [worker_command(args, policy) for policy in POLICIES]
         self.assertTrue(all("--basket" not in command for command in commands))
         self.assertEqual(len({command[command.index("--journal") + 1] for command in commands}), len(POLICIES))
@@ -63,12 +63,25 @@ class LiveAblationTests(unittest.TestCase):
             verify_flat_new_heat(SnapshotClient(late), SessionMarker(1, 1, "ACTIVE"))
 
     def test_nonflat_final_snapshot_does_not_count_as_a_completed_arm(self):
+        args = parse_args(["--trade", "--gross-limit", "300000", "--net-limit", "200000", "--run-id", "test"])
         policy = POLICIES[0]
-        path = f"data/etf-ablation-{policy.name}-decisions.jsonl"
+        path = f"data/etf-ablation-{args.run_id}-{policy.name}-decisions.jsonl"
         row = {"account_before": {"positions": {"BULL": 10, "BEAR": 0, "RITC": 0, "USD": 0}}}
         with patch("pathlib.Path.read_text", return_value=__import__("json").dumps(row) + "\n"):
             with self.assertRaisesRegex(RuntimeError, "did not finish flat"):
-                verify_worker_flat(policy)
+                verify_worker_flat(args, policy)
+
+    def test_nonflat_completed_heat_does_not_prevent_later_arms(self):
+        args = parse_args(["--trade", "--gross-limit", "300000", "--net-limit", "200000", "--max-heats", "2", "--run-id", "test"])
+        markers = [SessionMarker(1, 1, "ACTIVE"), SessionMarker(2, 1, "ACTIVE")]
+        with patch("scripts.run_etf_live_ablation.Client"), \
+             patch("scripts.run_etf_live_ablation.wait_for_fresh_heat", side_effect=markers), \
+             patch("scripts.run_etf_live_ablation.verify_flat_new_heat"), \
+             patch("scripts.run_etf_live_ablation.subprocess.Popen") as popen, \
+             patch("scripts.run_etf_live_ablation.verify_worker_flat", side_effect=[RuntimeError("not flat"), None]):
+            popen.return_value.wait.return_value = 0
+            run(args)
+        self.assertEqual(popen.call_count, 2)
 
 
 if __name__ == "__main__":
