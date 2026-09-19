@@ -40,8 +40,10 @@ DELTA_BAND = 7000     # penalty band: $0.10 per share over, per second
 # ~1.4-1.7x what 500 plain straddles gave under the same net cap.
 ATM_STRADDLES = 850    # straddles at the ATM strike, in the edge direction
 WING_CONTRACTS = 350   # contracts per far wing (lowest put + highest call), opposite way
-LATE_ENTRY_TICK = 260  # from here, new entries at half size: late deep-ITM books
-LATE_ENTRY_SCALE = 0.5 # were the worst trips and carry unhedgeable-delta fine risk
+LATE_ENTRY_TICK = 226  # from the week-4 announcement, new entries at half size:
+LATE_ENTRY_SCALE = 0.5 # near expiry a full book's delta flips +/-35k through the
+                       # strike faster than RTM can chase (a $40k fine window
+                       # at t232-262 of a real heat); half the book, half the flip
 ENTRY_EDGE = 15.0      # $ per straddle, net of costs, required to enter
                        # $10 was noise-chasing (heat 1), but $40 exceeds what
                        # late-heat vega (~$6-8 per vol pt at tick 150+) can even
@@ -51,6 +53,10 @@ CONVERGED_IV = 0.01    # exit when the position's REMAINING directional edge < 1
 HEDGE_TRIGGER = 2000   # hedge back toward 0 when |delta| exceeds this (band is 7000)
                        # was 5000: near expiry an ATM book's delta flips tens of
                        # thousands as spot crosses the strike, so hedge early and fully
+SUBTICK_TRIGGER = 4000 # between ticks, hedge immediately if a gamma flip blows
+                       # |delta| past this: at 35%+ realized vol, flips of 8-21k
+                       # happened BETWEEN once-per-tick looks, paying $0.10/share
+                       # per second until the next tick (a ~$30k heat of fines)
 POLL_SECONDS = 0.25
 
 OPTION = re.compile(r"RTM(\d+(?:\.\d+)?)([CP])$")
@@ -133,6 +139,33 @@ def submit(client, ticker, quantity, dry_run, lines):
                 lines.append(f"  REJECTED {action} {chunk} {ticker}: {error} -- skipping")
         remaining -= chunk
         time.sleep(0.05)
+
+
+def quick_hedge(client, dry_run, sigma, rate, tick):
+    """Between ticks, catch a gamma flip the moment it happens.
+
+    The full decision runs once per tick, but the fine clock runs per
+    second: in violent heats delta flipped 8-21k shares between looks and
+    paid the band penalty until the next tick. This lightweight check runs
+    on every poll (~4x/sec) and only hedges -- no exits, no entries.
+    """
+    if sigma is None or tick >= pricing.TOTAL_TICKS:
+        return
+    securities = client.get("securities")
+    rtm = next(s for s in securities if s["ticker"] == "RTM")
+    rtm_position = int(rtm["position"])
+    options = option_rows(securities)
+    if not rtm_position and not any(o["position"] for o in options):
+        return
+    spot = (float(rtm["bid"]) + float(rtm["ask"])) / 2.0
+    delta = portfolio_delta(spot, pricing.years_left(tick), rate, sigma, options, rtm_position)
+    if abs(delta) < SUBTICK_TRIGGER:
+        return
+    hedge = max(-RTM_LIMIT - rtm_position, min(RTM_LIMIT - rtm_position, -round(delta)))
+    if hedge:
+        lines = [f"  ~~ sub-tick hedge at t{tick}: |delta| {abs(delta):,.0f}"]
+        submit(client, "RTM", hedge, dry_run, lines)
+        print("\n".join(lines), flush=True)
 
 
 def process_tick(client, dry_run, decisions_path, market_path):
@@ -299,9 +332,16 @@ def process_tick(client, dry_run, decisions_path, market_path):
             decision = (f"enter: {side} {atm_size} straddles @ K={strike:g}"
                         f" + {'SELL' if sign > 0 else 'BUY'} wings {wing_text},"
                         f" edge ${max(buy_edge, sell_edge):.0f}/straddle > ${ENTRY_EDGE:.0f} threshold")
-            trades = weave([(call["symbol"], sign * atm_size),
-                            (put["symbol"], sign * atm_size)]
-                           + [(o["symbol"], -sign * q) for o, q in wings])
+            legs = [(call["symbol"], sign * atm_size), (put["symbol"], sign * atm_size)] \
+                   + [(o["symbol"], -sign * q) for o, q in wings]
+            # Weave the PREDICTED hedge into the entry itself: a fresh book
+            # carries 10-17k shares of inherent delta, and waiting one cycle
+            # for the hedge branch cost ~$2-3k of band fines per entry.
+            by_symbol = {o["symbol"]: o for o in options}
+            predicted = sum(q * MULT * pricing.bs_delta(by_symbol[s]["kind"], spot,
+                            by_symbol[s]["strike"], years, rate, sigma) for s, q in legs)
+            hedge = max(-RTM_LIMIT - rtm_position, min(RTM_LIMIT - rtm_position, -round(predicted)))
+            trades = weave(legs, rtm_quantity=hedge)
         else:
             decision = f"wait: best edge ${max(buy_edge, sell_edge):.0f}/straddle below ${ENTRY_EDGE:.0f} threshold"
 
@@ -315,7 +355,7 @@ def process_tick(client, dry_run, decisions_path, market_path):
                               "gross": gross, "net": net, "rtm": rtm_position,
                               "decision": decision, "trades": trades,
                               "dry_run": dry_run, **metrics}) + "\n")
-    return tick, len(info["exact"]) + len(info["ranges"])
+    return {"sigma": sigma, "rate": rate}
 
 
 def main():
@@ -335,7 +375,7 @@ def main():
     decisions_path, market_path = logs / f"decisions-{tag}.jsonl", logs / f"market-{tag}.jsonl"
     print(f"volatility bot starting ({'DRY RUN' if args.dry_run else 'LIVE'})\n"
           f"  decisions -> {decisions_path}\n  recording -> {market_path}")
-    last = None
+    last, context = None, None
     try:
         while True:
             try:
@@ -343,8 +383,11 @@ def main():
                 news_count = len(client.get("news"))
                 current = (case["tick"], case["period"], news_count)
                 if current != last:
-                    process_tick(client, args.dry_run, decisions_path, market_path)
+                    context = process_tick(client, args.dry_run, decisions_path, market_path)
                     last = current
+                elif context and str(case.get("status")) == "ACTIVE":
+                    quick_hedge(client, args.dry_run, context.get("sigma"),
+                                context.get("rate") or 0.0, int(case["tick"]))
             except (RuntimeError, OSError) as error:
                 print(f"  transient error, retrying: {error}", flush=True)
             time.sleep(POLL_SECONDS)
